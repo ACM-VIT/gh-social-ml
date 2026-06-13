@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import math
 from typing import Any
 import logging
 
@@ -218,6 +219,7 @@ class RepositoryEnricher:
         if languages:
             raw_repository["size"] = sum(languages.values()) // 1024
 
+        recent_commits = [commit.get("committedDate") for commit in commits if commit.get("committedDate")]
         payload = self.to_osiris_payload(
             raw_repository,
             readme=readme,
@@ -226,6 +228,7 @@ class RepositoryEnricher:
             contributors=contributors,
             events=events,
             stargazers=stargazers,
+            recent_commits=recent_commits,
         )
         
         return EnrichmentResult(
@@ -250,6 +253,7 @@ class RepositoryEnricher:
         contributors: list[dict[str, Any]],
         events: list[dict[str, Any]],
         stargazers: list[dict[str, Any]],
+        recent_commits: list[str] | None = None,
     ) -> dict[str, Any]:
         full_name = repository.get("full_name") or repository.get("name") or "unknown/repository"
         size_kb = int(repository.get("size") or 0)
@@ -280,6 +284,7 @@ class RepositoryEnricher:
             "pushed_at": repository.get("pushed_at"),
             "discovery_category": repository.get("_discovery_category"),
             "discovery_band": repository.get("_discovery_band"),
+            "recent_commits": recent_commits or [],
         }
 
 
@@ -310,15 +315,41 @@ class RepositoryEnricher:
         windows = {3: 0, 7: 0, 30: 0}
         now = datetime.now(timezone.utc)
         timestamps = [self._parse_datetime(item.get("starred_at")) for item in stargazers if item.get("starred_at")]
-        timestamps = [value for value in timestamps if value]
+        timestamps = sorted([value for value in timestamps if value])
+        total_stars = int(repository.get("stargazers_count") or repository.get("watchers_count") or 0)
+
         if timestamps:
-            for days in windows:
-                windows[days] = sum(1 for value in timestamps if (now - value).days <= days)
-            return windows
+            if len(timestamps) >= total_stars or len(timestamps) < 100:
+                for days in windows:
+                    windows[days] = sum(1 for value in timestamps if (now - value).days <= days)
+                return windows
+
+            n = len(timestamps)
+            if n >= 2:
+                oldest_ts = timestamps[0]
+                newest_ts = timestamps[-1]
+                span_seconds = (newest_ts - oldest_ts).total_seconds()
+                span_days = span_seconds / 86400.0
+                if span_days < 0.1:
+                    span_days = 0.1
+
+                recent_rate = n / span_days
+                oldest_days_ago = (now - oldest_ts).total_seconds() / 86400.0
+
+                for W in windows:
+                    if W <= oldest_days_ago:
+                        windows[W] = sum(1 for ts in timestamps if (now - ts).total_seconds() / 86400.0 <= W)
+                    else:
+                        observed = n
+                        t_diff = W - oldest_days_ago
+                        decay_constant = 0.05
+                        extrapolated = recent_rate * (1.0 - math.exp(-decay_constant * t_diff)) / decay_constant
+                        windows[W] = min(int(round(observed + extrapolated)), total_stars)
+                return windows
 
         push_events = [event for event in events if event.get("type") in {"PushEvent", "CreateEvent", "PullRequestEvent", "IssuesEvent"}]
         pushed_days_ago = self._days_since(repository.get("pushed_at"))
-        stars = int(repository.get("stargazers_count") or 0)
+        stars = total_stars
         activity_multiplier = min(len(push_events) / 30.0, 1.0)
         recency_multiplier = 1.0 if pushed_days_ago <= 3 else 0.6 if pushed_days_ago <= 7 else 0.25 if pushed_days_ago <= 30 else 0.05
         baseline_monthly = max(int((stars ** 0.5) * activity_multiplier * recency_multiplier), 0)
