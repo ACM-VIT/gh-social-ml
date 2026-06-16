@@ -245,3 +245,17 @@ if __name__ == "__main__":
     )
 
     _print_summary(kept, dropped)
+
+    # ── Step 3: Database Ingestion ────────────────────────────────────────────
+    from database import PostgreSQLConnector
+    db_connector = PostgreSQLConnector()
+    if db_connector.enabled:
+        try:
+            db_connector.init_db()
+            saved_count = db_connector.upsert_repositories(kept)
+            logger.info(f"Successfully saved {saved_count} repositories to database.")
+        except Exception as db_exc:
+            logger.error(f"Failed to ingest repositories into database: {db_exc}")
+    else:
+        logger.info("Database URL not configured; skipping database upload.")
+
