@@ -8,6 +8,7 @@ embeddings that are stored in Qdrant for similarity-based matching.
 import os
 import logging
 import uuid
+import copy
 from typing import Any, Dict
 
 try:
@@ -28,12 +29,83 @@ except ImportError:
 # Once merged, these can be replaced with: from config import EMBEDDING_MODEL, VECTOR_DIMENSION
 
 EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-VECTOR_DIMENSION: int = int(os.getenv("VECTOR_DIMENSION", "384"))
+
+# Safely parse VECTOR_DIMENSION with fallback to prevent crashes on invalid values
+try:
+    VECTOR_DIMENSION: int = int(os.getenv("VECTOR_DIMENSION", "384"))
+except (ValueError, TypeError):
+    logger.warning("Invalid VECTOR_DIMENSION in environment, using default 384")
+    VECTOR_DIMENSION: int = 384
 QDRANT_URL: str | None = os.getenv("QDRANT_URL", None)
 QDRANT_API_KEY: str | None = os.getenv("QDRANT_API_KEY", None)
 USER_PROFILES_COLLECTION: str = "user_profiles"
 
 logger = logging.getLogger("pipeline.user_onboarding")
+
+
+def _synthesize_user_context_impl(user_data: Dict[str, Any]) -> str:
+    """Pure helper function to flatten user profile data into a single dense text string.
+
+    This function contains the core synthesis logic without any dependencies on
+    the SentenceTransformer model, allowing it to be used independently.
+
+    Args:
+        user_data: Dictionary containing user profile fields:
+            - skills: List[str] - User's technical skills
+            - tech_stack: List[str] - User's technology stack preferences
+            - interests: List[str] - User's interests
+            - bio: str - User's biography/description
+
+    Returns:
+        A single dense text string combining all user profile information.
+    """
+    skills = user_data.get("skills", [])
+    tech_stack = user_data.get("tech_stack", [])
+    interests = user_data.get("interests", [])
+    bio = user_data.get("bio", "")
+
+    # Convert lists to comma-separated strings with explicit string casting
+    # to handle ints, floats, None, or other non-string types safely
+    if isinstance(skills, list):
+        skills_str = ", ".join(str(item) if item is not None else "" for item in skills)
+    else:
+        skills_str = str(skills) if skills is not None else ""
+    
+    if isinstance(tech_stack, list):
+        tech_stack_str = ", ".join(str(item) if item is not None else "" for item in tech_stack)
+    else:
+        tech_stack_str = str(tech_stack) if tech_stack is not None else ""
+    
+    if isinstance(interests, list):
+        interests_str = ", ".join(str(item) if item is not None else "" for item in interests)
+    else:
+        interests_str = str(interests) if interests is not None else ""
+
+    # Handle bio field - ensure it's a string
+    bio_str = str(bio) if bio is not None else ""
+
+    # Synthesize into a dense, coherent text representation
+    context_parts = []
+    
+    if skills_str:
+        context_parts.append(f"Skills: {skills_str}")
+    
+    if tech_stack_str:
+        context_parts.append(f"Tech Stack: {tech_stack_str}")
+    
+    if interests_str:
+        context_parts.append(f"Interests: {interests_str}")
+    
+    if bio_str:
+        context_parts.append(f"Bio: {bio_str}")
+
+    synthesized_context = ". ".join(context_parts)
+    
+    if not synthesized_context:
+        logger.warning("User data is empty or missing all fields.")
+        return ""
+
+    return synthesized_context
 
 
 class UserOnboardingPipeline:
@@ -68,8 +140,8 @@ class UserOnboardingPipeline:
     def synthesize_user_context(self, user_data: Dict[str, Any]) -> str:
         """Flatten user profile data into a single dense text string.
 
-        This helper function combines skills, tech_stack, interests, and bio
-        into a unified text representation suitable for embedding generation.
+        This method delegates to the pure helper function to avoid loading
+        the SentenceTransformer model when only text synthesis is needed.
 
         Args:
             user_data: Dictionary containing user profile fields:
@@ -92,38 +164,7 @@ class UserOnboardingPipeline:
             >>> print(context)
             'Skills: Python, Machine Learning. Tech Stack: PyTorch, FastAPI. ...
         """
-        skills = user_data.get("skills", [])
-        tech_stack = user_data.get("tech_stack", [])
-        interests = user_data.get("interests", [])
-        bio = user_data.get("bio", "")
-
-        # Convert lists to comma-separated strings
-        skills_str = ", ".join(skills) if isinstance(skills, list) else str(skills)
-        tech_stack_str = ", ".join(tech_stack) if isinstance(tech_stack, list) else str(tech_stack)
-        interests_str = ", ".join(interests) if isinstance(interests, list) else str(interests)
-
-        # Synthesize into a dense, coherent text representation
-        context_parts = []
-        
-        if skills_str:
-            context_parts.append(f"Skills: {skills_str}")
-        
-        if tech_stack_str:
-            context_parts.append(f"Tech Stack: {tech_stack_str}")
-        
-        if interests_str:
-            context_parts.append(f"Interests: {interests_str}")
-        
-        if bio:
-            context_parts.append(f"Bio: {bio}")
-
-        synthesized_context = ". ".join(context_parts)
-        
-        if not synthesized_context:
-            logger.warning("User data is empty or missing all fields.")
-            return ""
-
-        return synthesized_context
+        return _synthesize_user_context_impl(user_data)
 
     def generate_interest_vector(self, user_data: Dict[str, Any]) -> list[float]:
         """Generate Day-1 Initial Interest Vector from user profile data.
@@ -139,24 +180,38 @@ class UserOnboardingPipeline:
             A list of floats representing the user's interest vector.
 
         Raises:
-            ValueError: If user_data is empty or synthesis fails.
+            ValueError: If user_data is invalid, empty, or synthesis fails.
         """
+        # Validate user_data is a dictionary
+        if not isinstance(user_data, dict):
+            raise ValueError("user_data must be a dictionary.")
+
         context = self.synthesize_user_context(user_data)
         
         if not context:
             raise ValueError("Cannot generate vector from empty user data.")
 
         try:
-            embedding = self.model.encode(context, convert_to_numpy=False)
+            embedding = self.model.encode(context)
+            if embedding is None:
+                raise ValueError("Model.encode returned None.")
             vector = embedding.tolist()
             
             # Validate vector dimension matches expected dimension
             if len(vector) != VECTOR_DIMENSION:
-                logger.warning(
+                raise ValueError(
                     f"Generated vector dimension {len(vector)} does not match "
                     f"expected VECTOR_DIMENSION {VECTOR_DIMENSION}. "
-                    "This may indicate a model mismatch."
+                    "This indicates a model mismatch or configuration error."
                 )
+            
+            # Validate vector elements are numbers
+            import math
+            for i, val in enumerate(vector):
+                if not isinstance(val, (int, float)):
+                    raise ValueError(f"Vector element at index {i} is not a number: {val}")
+                if math.isnan(val) or math.isinf(val):
+                    raise ValueError(f"Vector element at index {i} is NaN or Inf: {val}")
             
             return vector
         except Exception as exc:
@@ -189,12 +244,29 @@ class UserOnboardingPipeline:
 
         Raises:
             ImportError: If qdrant-client is not installed.
+            ValueError: If user_id or vector validation fails.
         """
         if not HAS_QDRANT:
             raise ImportError(
                 "qdrant-client is not installed. "
                 "Run 'pip install qdrant-client' to enable Qdrant storage."
             )
+
+        # Validate user_id
+        if not user_id or not isinstance(user_id, str):
+            raise ValueError("user_id must be a non-empty string.")
+
+        # Validate vector
+        if not isinstance(vector, list) or len(vector) == 0:
+            raise ValueError("vector must be a non-empty list.")
+
+        # Validate vector elements are numbers and not NaN/Inf
+        import math
+        for i, val in enumerate(vector):
+            if not isinstance(val, (int, float)):
+                raise ValueError(f"Vector element at index {i} is not a number: {val}")
+            if math.isnan(val) or math.isinf(val):
+                raise ValueError(f"Vector element at index {i} is NaN or Inf: {val}")
 
         # Use provided parameters or fall back to environment variables
         url = qdrant_url or QDRANT_URL
@@ -207,14 +279,16 @@ class UserOnboardingPipeline:
             )
             return False
 
-        # Ensure payload contains user_id
+        # Ensure payload contains user_id (copy to avoid mutating caller's object)
         if payload is None:
             payload = {}
+        else:
+            payload = copy.copy(payload)
         payload["user_id"] = user_id
 
         try:
-            # Initialize Qdrant client
-            client = QdrantClient(url=url, api_key=api_key)
+            # Initialize Qdrant client with timeout for production safety
+            client = QdrantClient(url=url, api_key=api_key, timeout=30.0)
 
             # Check if collection exists, create if not
             collections = client.get_collections().collections
@@ -222,14 +296,21 @@ class UserOnboardingPipeline:
 
             if USER_PROFILES_COLLECTION not in collection_names:
                 logger.info(f"Creating collection '{USER_PROFILES_COLLECTION}'...")
-                client.create_collection(
-                    collection_name=USER_PROFILES_COLLECTION,
-                    vectors_config=VectorParams(
-                        size=VECTOR_DIMENSION,
-                        distance=Distance.COSINE,
-                    ),
-                )
-                logger.info(f"Collection '{USER_PROFILES_COLLECTION}' created successfully.")
+                try:
+                    client.create_collection(
+                        collection_name=USER_PROFILES_COLLECTION,
+                        vectors_config=VectorParams(
+                            size=VECTOR_DIMENSION,
+                            distance=Distance.COSINE,
+                        ),
+                    )
+                    logger.info(f"Collection '{USER_PROFILES_COLLECTION}' created successfully.")
+                except Exception as exc:
+                    # Handle race condition: collection may have been created by another process
+                    if "already exists" in str(exc).lower() or "collection" in str(exc).lower():
+                        logger.info(f"Collection '{USER_PROFILES_COLLECTION}' already exists (race condition handled).")
+                    else:
+                        raise
 
             # Convert user_id to deterministic UUID for Qdrant compatibility
             point_uuid = uuid.uuid5(uuid.NAMESPACE_URL, f"user:{user_id}")
@@ -294,8 +375,8 @@ class UserOnboardingPipeline:
 def synthesize_user_context(user_data: Dict[str, Any]) -> str:
     """Flatten user profile data into a single dense text string.
 
-    This is a standalone convenience function that creates a UserOnboardingPipeline
-    instance internally. For repeated use, instantiate the class directly.
+    This is a standalone convenience function that calls the pure helper
+    directly without loading the SentenceTransformer model.
 
     Args:
         user_data: Dictionary containing user profile fields.
@@ -303,8 +384,7 @@ def synthesize_user_context(user_data: Dict[str, Any]) -> str:
     Returns:
         A single dense text string combining all user profile information.
     """
-    pipeline = UserOnboardingPipeline()
-    return pipeline.synthesize_user_context(user_data)
+    return _synthesize_user_context_impl(user_data)
 
 
 def generate_interest_vector(user_data: Dict[str, Any]) -> list[float]:
@@ -387,6 +467,13 @@ def onboard_user(
 # ── Example Usage ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # Load environment variables from .env file for local testing
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        logger.warning("python-dotenv not installed. Skipping .env loading.")
+    
     # Configure logging for standalone execution
     logging.basicConfig(
         level=logging.INFO,
