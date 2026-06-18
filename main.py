@@ -286,14 +286,17 @@ if __name__ == "__main__":
     if not args.no_index_qdrant:
         # The below block is for automatic Qdrant indexing after filtering; use
         # --no-index-qdrant only for acquisition-only local runs.
-        indexed = index_approved_repositories(
-            kept,
-            qdrant_url=args.qdrant_url,
-            qdrant_api_key=args.qdrant_api_key,
-            qdrant_collection=args.qdrant_collection,
-            embedding_model=args.embedding_model,
-        )
-        logger.info("Qdrant indexing complete: %d repository vectors stored", len(indexed))
+        try:
+            indexed = index_approved_repositories(
+                kept,
+                qdrant_url=args.qdrant_url,
+                qdrant_api_key=args.qdrant_api_key,
+                qdrant_collection=args.qdrant_collection,
+                embedding_model=args.embedding_model,
+            )
+            logger.info("Qdrant indexing complete: %d repository vectors stored", len(indexed))
+        except Exception as exc:
+            logger.error("Qdrant indexing failed; continuing to database ingestion: %s", exc)
 
     # ── Step 3: Database Ingestion ────────────────────────────────────────────
     from database import PostgreSQLConnector

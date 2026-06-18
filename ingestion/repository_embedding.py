@@ -26,6 +26,12 @@ from .features import (
 from .classification import classify_category
 
 
+SUPPORTED_REPOSITORY_EMBEDDING_DIMS = {
+    "all-MiniLM-L6-v2": 384,
+    "sentence-transformers/all-MiniLM-L6-v2": 384,
+}
+
+
 @dataclass(slots=True)
 class RepositoryEmbeddingConfig:
     """Configuration for repository embedding generation."""
@@ -36,6 +42,21 @@ class RepositoryEmbeddingConfig:
     readme_chunk_chars: int = README_CHUNK_CHARS
     readme_chunk_overlap_chars: int = README_CHUNK_OVERLAP_CHARS
     tower_weights: dict[str, float] = field(default_factory=lambda: dict(REPO_TOWER_WEIGHTS))
+
+    def __post_init__(self) -> None:
+        expected_dim = SUPPORTED_REPOSITORY_EMBEDDING_DIMS.get(self.model_name)
+        if expected_dim is None:
+            supported = ", ".join(sorted(SUPPORTED_REPOSITORY_EMBEDDING_DIMS))
+            raise ValueError(
+                f"Unsupported repository embedding model {self.model_name!r}. "
+                "The current Qdrant schema requires a known repository embedding dimension. "
+                f"Supported models: {supported}."
+            )
+        if int(self.embedding_dim) != expected_dim:
+            raise ValueError(
+                f"Repository embedding model {self.model_name!r} produces {expected_dim} dimensions, "
+                f"but embedding_dim is configured as {self.embedding_dim}."
+            )
 
 
 @dataclass(slots=True)
