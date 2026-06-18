@@ -119,8 +119,7 @@ def _synthesize_user_context_impl(user_data: Dict[str, Any]) -> str:
     synthesized_context = ". ".join(context_parts)
     
     if not synthesized_context:
-        logger.warning("User data is empty or missing all fields.")
-        return ""
+        raise ValueError("User data is empty or missing all fields. Cannot synthesize context.")
 
     return synthesized_context
 
@@ -353,8 +352,45 @@ class UserOnboardingPipeline:
                     logger.info(f"Collection '{USER_PROFILES_COLLECTION}' created successfully.")
                 except Exception as exc:
                     # Handle race condition: collection may have been created by another process
-                    if "already exists" in str(exc).lower() or "collection" in str(exc).lower():
+                    # Only catch "already exists" errors - let all other errors propagate
+                    if "already exists" in str(exc).lower():
                         logger.info(f"Collection '{USER_PROFILES_COLLECTION}' already exists (race condition handled).")
+                        # Validate schema of the race-condition-created collection
+                        logger.info(f"Validating schema for race-condition-created collection...")
+                        collection_info = client.get_collection(USER_PROFILES_COLLECTION)
+                        if collection_info is None or collection_info.config is None or collection_info.config.params is None:
+                            raise ValueError(f"Failed to retrieve configuration for collection '{USER_PROFILES_COLLECTION}'.")
+                        
+                        vectors_config = collection_info.config.params.vectors
+                        if vectors_config is None:
+                            raise ValueError(f"Collection '{USER_PROFILES_COLLECTION}' has no vectors configuration.")
+                        
+                        # Handle both dict and VectorParams formats
+                        if isinstance(vectors_config, dict):
+                            existing_size = vectors_config.get("size")
+                            existing_distance = vectors_config.get("distance")
+                        else:
+                            existing_size = getattr(vectors_config, "size", None)
+                            existing_distance = getattr(vectors_config, "distance", None)
+                        
+                        if existing_size != VECTOR_DIMENSION:
+                            raise ValueError(
+                                f"Collection '{USER_PROFILES_COLLECTION}' schema mismatch: "
+                                f"existing vector size is {existing_size}, but expected {VECTOR_DIMENSION}. "
+                                f"Recreate the collection with the correct configuration."
+                            )
+                        
+                        # Normalize distance metric comparison (Qdrant may return different representations)
+                        expected_distance = str(Distance.COSINE).upper()
+                        actual_distance = str(existing_distance).upper() if existing_distance else ""
+                        if expected_distance not in actual_distance and actual_distance not in expected_distance:
+                            raise ValueError(
+                                f"Collection '{USER_PROFILES_COLLECTION}' schema mismatch: "
+                                f"existing distance metric is {existing_distance}, but expected {Distance.COSINE}. "
+                                f"Recreate the collection with the correct configuration."
+                            )
+                        
+                        logger.info(f"Collection '{USER_PROFILES_COLLECTION}' schema validated successfully.")
                     else:
                         raise
             else:
