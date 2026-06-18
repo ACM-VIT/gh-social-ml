@@ -365,11 +365,23 @@ class UserOnboardingPipeline:
                         if vectors_config is None:
                             raise ValueError(f"Collection '{USER_PROFILES_COLLECTION}' has no vectors configuration.")
                         
-                        # Handle both dict and VectorParams formats
+                        # Handle dict, named-vector dict, or VectorParams formats
                         if isinstance(vectors_config, dict):
-                            existing_size = vectors_config.get("size")
-                            existing_distance = vectors_config.get("distance")
+                            # Check if it's a flat config dict (has "size" key)
+                            if "size" in vectors_config:
+                                existing_size = vectors_config.get("size")
+                                existing_distance = vectors_config.get("distance")
+                            else:
+                                # Assume it's a named-vector mapping: {"": VectorParams(...)} or {"default": VectorParams(...)}
+                                # Extract the first VectorParams object from values
+                                named_vector_configs = list(vectors_config.values())
+                                if not named_vector_configs:
+                                    raise ValueError(f"Collection '{USER_PROFILES_COLLECTION}' has empty named-vector configuration.")
+                                first_config = named_vector_configs[0]
+                                existing_size = getattr(first_config, "size", None)
+                                existing_distance = getattr(first_config, "distance", None)
                         else:
+                            # Direct VectorParams object
                             existing_size = getattr(vectors_config, "size", None)
                             existing_distance = getattr(vectors_config, "distance", None)
                         
@@ -404,11 +416,23 @@ class UserOnboardingPipeline:
                 if vectors_config is None:
                     raise ValueError(f"Collection '{USER_PROFILES_COLLECTION}' has no vectors configuration.")
                 
-                # Handle both dict and VectorParams formats
+                # Handle dict, named-vector dict, or VectorParams formats
                 if isinstance(vectors_config, dict):
-                    existing_size = vectors_config.get("size")
-                    existing_distance = vectors_config.get("distance")
+                    # Check if it's a flat config dict (has "size" key)
+                    if "size" in vectors_config:
+                        existing_size = vectors_config.get("size")
+                        existing_distance = vectors_config.get("distance")
+                    else:
+                        # Assume it's a named-vector mapping: {"": VectorParams(...)} or {"default": VectorParams(...)}
+                        # Extract the first VectorParams object from values
+                        named_vector_configs = list(vectors_config.values())
+                        if not named_vector_configs:
+                            raise ValueError(f"Collection '{USER_PROFILES_COLLECTION}' has empty named-vector configuration.")
+                        first_config = named_vector_configs[0]
+                        existing_size = getattr(first_config, "size", None)
+                        existing_distance = getattr(first_config, "distance", None)
                 else:
+                    # Direct VectorParams object
                     existing_size = getattr(vectors_config, "size", None)
                     existing_distance = getattr(vectors_config, "distance", None)
                 
