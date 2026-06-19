@@ -1,0 +1,9 @@
+# The below packages are for acquisition, repository embeddings, and Qdrant indexing.
+python-dotenv
+requests
+numpy
+sentence-transformers
+qdrant-client
+pg8000
+
+# docker in your system

@@ -167,6 +167,37 @@ def filter_enriched(
     return kept, dropped
 
 
+def index_approved_repositories(
+    approved: list,
+    *,
+    qdrant_url: str | None = None,
+    qdrant_api_key: str | None = None,
+    qdrant_collection: str | None = None,
+    embedding_model: str | None = None,
+) -> list:
+    """Embed approved repositories and persist their vectors to Qdrant."""
+    if not approved:
+        logger.warning("Skipping Qdrant indexing because no repositories passed the filter.")
+        return []
+
+    from ingestion.config import QDRANT_API_KEY, QDRANT_COLLECTION_NAME, QDRANT_URL
+    from ingestion.embedding_pipeline import RepositoryEmbeddingPipeline
+    from ingestion.qdrant_store import QdrantRepositoryStore
+    from ingestion.repository_embedding import RepositoryEmbeddingConfig
+
+    embedding_config = RepositoryEmbeddingConfig(
+        model_name=embedding_model or os.getenv("EMBEDDING_MODEL") or "all-MiniLM-L6-v2",
+    )
+    store = QdrantRepositoryStore(
+        url=qdrant_url or QDRANT_URL,
+        api_key=qdrant_api_key or QDRANT_API_KEY,
+        collection_name=qdrant_collection or QDRANT_COLLECTION_NAME,
+        vector_size=embedding_config.embedding_dim,
+    )
+    pipeline = RepositoryEmbeddingPipeline(config=embedding_config, store=store)
+    return pipeline.index_batch(approved)
+
+
 # ── Summary printer ───────────────────────────────────────────────────────────
 
 def _print_summary(kept: list, dropped: list) -> None:
@@ -218,6 +249,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--limit",            type=int, default=100,    help="Target number of repos (default: 100)")
     p.add_argument("--batch-size",       type=int, default=10,     help="Enrichment batch size (default: 10)")
     p.add_argument("--min-readme-chars", type=int, default=200,    help="Minimum README length to keep a repo (default: 200)")
+    p.add_argument("--index-qdrant",     action="store_true",      help="Deprecated: Qdrant indexing now runs by default")
+    p.add_argument("--no-index-qdrant",  action="store_true",      help="Skip automatic Qdrant indexing after filtering")
+    p.add_argument("--qdrant-url",       type=str, default=None,    help="Qdrant URL (default: QDRANT_URL or http://localhost:6333)")
+    p.add_argument("--qdrant-api-key",   type=str, default=None,    help="Qdrant API key (default: QDRANT_API_KEY)")
+    p.add_argument("--qdrant-collection", type=str, default=None,   help="Qdrant collection name override")
+    p.add_argument("--embedding-model",  type=str, default=None,    help="SentenceTransformer model override")
     p.add_argument("--log-level",        type=str, default="INFO", help="Logging level (default: INFO)")
     return p.parse_args()
 
@@ -245,6 +282,21 @@ if __name__ == "__main__":
     )
 
     _print_summary(kept, dropped)
+
+    if not args.no_index_qdrant:
+        # The below block is for automatic Qdrant indexing after filtering; use
+        # --no-index-qdrant only for acquisition-only local runs.
+        try:
+            indexed = index_approved_repositories(
+                kept,
+                qdrant_url=args.qdrant_url,
+                qdrant_api_key=args.qdrant_api_key,
+                qdrant_collection=args.qdrant_collection,
+                embedding_model=args.embedding_model,
+            )
+            logger.info("Qdrant indexing complete: %d repository vectors stored", len(indexed))
+        except Exception as exc:
+            logger.error("Qdrant indexing failed; continuing to database ingestion: %s", exc)
 
     # ── Step 3: Database Ingestion ────────────────────────────────────────────
     from database import PostgreSQLConnector

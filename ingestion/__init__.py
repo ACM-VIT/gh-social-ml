@@ -4,6 +4,12 @@ from .classification import classify_category
 from .corpus import CorpusStore, dynamic_cluster_discovery
 from .result import IngestionResult
 
+# The below exports are for the public embedding/Qdrant API used by main.py and
+# validation scripts.
+from .embedding_pipeline import RepositoryEmbeddingPipeline, embed_repositories, index_repositories
+from .repository_embedding import RepositoryEmbeddingConfig, RepositoryEmbeddingResult
+from .qdrant_store import QdrantRepositoryStore
+
 __all__ = [
     "ingest_repository",
     "ingest_batch",
@@ -16,6 +22,12 @@ __all__ = [
     "classify_category",
     "CorpusStore",
     "dynamic_cluster_discovery",
-    "IngestionResult"
+    "IngestionResult",
+    "RepositoryEmbeddingPipeline",
+    "RepositoryEmbeddingConfig",
+    "RepositoryEmbeddingResult",
+    "QdrantRepositoryStore",
+    "embed_repositories",
+    "index_repositories",
 ]
 
