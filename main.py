@@ -371,9 +371,9 @@ if __name__ == "__main__":
     if current_count >= target_count:
         logger.info("Corpus target of 1000 reached. Executing L1 Candidate Retrieval Demo...")
         try:
-            from mock_users import MOCK_USERS
+            from scripts.mock_users import MOCK_USERS
             from retrieval import CandidateRetriever
-            from user_onboarding import generate_interest_vector
+            from scripts.user_onboarding import generate_interest_vector
 
             retriever = CandidateRetriever(
                 db_connector=db,
