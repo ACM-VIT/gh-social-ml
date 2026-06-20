@@ -284,7 +284,12 @@ class RetrievalEngine:
                 data = json.loads(data)
 
             # Validate shape
-            if isinstance(data, dict) and "batch_1" in data:
+            required_batches = {"batch_1", "batch_2", "batch_3"}
+            if (
+                isinstance(data, dict)
+                and required_batches.issubset(data)
+                and all(isinstance(data[key], list) for key in required_batches)
+            ):
                 logger.info("Loaded cached batches for '%s' from Postgres.", user_id)
                 return data
 
