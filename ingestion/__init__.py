@@ -18,4 +18,28 @@ __all__ = [
     "dynamic_cluster_discovery",
     "IngestionResult",
     "NoveltyMatrix",
+    
+    # Legacy re-exports for backwards compatibility
+    "RepositoryEmbeddingPipeline",
+    "RepositoryEmbeddingConfig",
+    "RepositoryEmbeddingResult",
+    "QdrantRepositoryStore",
+    "embed_repositories",
+    "index_repositories",
 ]
+
+def __getattr__(name: str):
+    if name in {
+        "RepositoryEmbeddingPipeline",
+        "RepositoryEmbeddingConfig",
+        "RepositoryEmbeddingResult",
+        "QdrantRepositoryStore",
+        "embed_repositories",
+        "index_repositories",
+    }:
+        import embedding
+        return getattr(embedding, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+def __dir__():
+    return sorted(__all__)

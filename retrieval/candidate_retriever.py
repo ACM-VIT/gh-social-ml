@@ -155,16 +155,20 @@ class CandidateRetriever:
         semantic_ids = self._retrieve_semantic(user_embedding, semantic_quota)
 
         # ── Determine trending quota ─────────────────────────────────────
-        # If semantic channel was expected to run but returned fewer results than semantic_quota
-        # (e.g. Qdrant is down, or failed, or matched fewer items), reallocate the unused
-        # semantic quota to trending to backfill/fill the pool.
-        # Otherwise, if semantic retrieval was explicitly disabled (user_embedding is None),
-        # cap the trending quota at TRENDING_LIMIT to avoid fetching too many rows.
-        if user_embedding is not None:
-            unique_semantic = len({c.get("full_name") or c.get("repo_id") for c in semantic_ids if c.get("full_name") or c.get("repo_id")})
-            trending_quota = max(TOTAL_CANDIDATE_POOL - unique_semantic, TRENDING_LIMIT)
+        # If Qdrant is disabled or user_embedding is None (cold start), we want to
+        # reallocate/transfer the full semantic quota to the trending channel to backfill
+        # the pool up to TOTAL_CANDIDATE_POOL (150).
+        # Otherwise, if Qdrant is enabled, we query semantic search. If it fails or returns 
+        # 0 matches, we fall back to querying TOTAL_CANDIDATE_POOL from trending.
+        # If semantic search succeeds (returns > 0 matches), we cap trending at TRENDING_LIMIT.
+        if user_embedding is None or self._qdrant_store is None:
+            trending_quota = TOTAL_CANDIDATE_POOL
         else:
-            trending_quota = TRENDING_LIMIT
+            unique_semantic = len({c.get("full_name") or c.get("repo_id") for c in semantic_ids if c.get("full_name") or c.get("repo_id")})
+            if unique_semantic == 0:
+                trending_quota = TOTAL_CANDIDATE_POOL
+            else:
+                trending_quota = TRENDING_LIMIT
 
         logger.info(
             "Retrieval quotas — Semantic (actual fetched): %d, Trending: %d (total target: %d)",

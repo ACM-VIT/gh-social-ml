@@ -294,34 +294,45 @@ if __name__ == "__main__":
     db = PostgreSQLConnector()
     
     current_count = 0
+    db_verified = False
     if db.enabled:
         if db.verify_connection():
             try:
                 db.init_db()
                 current_count = db.get_repo_count()
                 logger.info(f"Current repositories in PostgreSQL database: {current_count}")
+                db_verified = True
             except Exception as db_exc:
                 logger.error(f"Failed to query database repository count: {db_exc}")
         else:
-            logger.error("Database connection failed. Check DATABASE_URL in .env.")
-            sys.exit(1)
+            logger.warning("Database connection failed. Ingestion/hydration will be disabled. Check DATABASE_URL in .env.")
     else:
-        logger.error("Database connector is not enabled. Ingestion requires PostgreSQL.")
-        sys.exit(1)
+        logger.info("Database connector is not enabled. Ingestion/hydration will be disabled.")
 
     target_count = 1000
     kept = []
 
     # ── Step 2: Fetch & Index if under target ─────────────────────────────────
-    if current_count >= target_count:
+    # If database is enabled and connected, we target reaching target_count.
+    # Otherwise, we just fetch args.limit repositories directly.
+    if db_verified:
+        should_fetch = current_count < target_count
+        fetch_limit = min(target_count - current_count, args.limit)
+    else:
+        should_fetch = True
+        fetch_limit = args.limit
+
+    if not should_fetch:
         logger.info(f"Approved corpus has {current_count} repositories (>= {target_count}). Skipping new repository acquisition.")
     else:
-        fetch_limit = min(target_count - current_count, args.limit)
-        logger.info(f"Approved corpus has {current_count} repositories. Fetching up to {fetch_limit} repositories to reach the {target_count} target...")
+        if db_verified:
+            logger.info(f"Approved corpus has {current_count} repositories. Fetching up to {fetch_limit} repositories to reach the {target_count} target...")
+        else:
+            logger.info(f"Database ingestion is disabled. Fetching exactly {fetch_limit} repositories for local execution...")
 
         # Load existing repos to filter out duplicates in run_acquisition
         existing_repos = set()
-        if db.enabled:
+        if db.enabled and db_verified:
             conn = None
             try:
                 conn = db.connect()
@@ -348,8 +359,25 @@ if __name__ == "__main__":
 
         _print_summary(kept, dropped)
 
+        # PostgreSQL Ingestion (First to ensure consistency and prevent orphaned points in Qdrant)
+        db_ingestion_success = False
+        if kept and db_verified:
+            try:
+                saved_count = db.upsert_repositories(kept)
+                current_count = db.get_repo_count()
+                logger.info(
+                    f"Database ingestion complete: {saved_count} upserted this run, "
+                    f"{current_count} total repos in database."
+                )
+                db_ingestion_success = True
+            except Exception as db_exc:
+                logger.error(f"Failed to ingest repositories into database: {db_exc}")
+        elif kept and not db_verified:
+            # If DB is not enabled/verified, treat as success to proceed with Qdrant indexing
+            db_ingestion_success = True
+
         # Qdrant Indexing
-        if kept and not args.no_index_qdrant:
+        if kept and db_ingestion_success and not args.no_index_qdrant:
             try:
                 indexed = index_approved_repositories(
                     kept,
@@ -360,19 +388,7 @@ if __name__ == "__main__":
                 )
                 logger.info("Qdrant indexing complete: %d repository vectors stored", len(indexed))
             except Exception as exc:
-                logger.error("Qdrant indexing failed; continuing to database ingestion: %s", exc)
-
-        # PostgreSQL Ingestion
-        if kept:
-            try:
-                saved_count = db.upsert_repositories(kept)
-                current_count = db.get_repo_count()
-                logger.info(
-                    f"Database ingestion complete: {saved_count} upserted this run, "
-                    f"{current_count} total repos in database."
-                )
-            except Exception as db_exc:
-                logger.error(f"Failed to ingest repositories into database: {db_exc}")
+                logger.error("Qdrant indexing failed: %s", exc)
 
     # ── Step 3: Candidate Retrieval for Hardcoded Users ───────────────────────
     if current_count >= target_count:
