@@ -236,7 +236,11 @@ class TrendingStorage:
 
                 except Exception as exc:
                     logger.warning(f"Failed to upsert repo {repo.get('full_name')}: {exc}")
-                    cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name};")
+                    try:
+                        cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name};")
+                    except Exception as rollback_exc:
+                        logger.critical(f"Failed to rollback savepoint {savepoint_name}: {rollback_exc}")
+                        break
                     continue
 
             conn.commit()
@@ -257,8 +261,8 @@ class TrendingStorage:
                 logger.warning(f"Skipping cleanup: batch write was not 100% successful ({len(successful_full_names)}/{len(repositories)} upserted).")
 
             # Update metadata with last refresh timestamp
-            # Only advance timestamp if data was actually written
-            if successful_full_names:
+            # Only advance timestamp if batch was 100% successful
+            if len(successful_full_names) == len(repositories):
                 self._update_metadata(cursor, "last_refresh", refresh_ts.isoformat())
                 self._update_metadata(cursor, "repo_count", str(len(successful_full_names)))
                 conn.commit()

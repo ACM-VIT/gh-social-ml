@@ -235,8 +235,10 @@ class TestStartScheduled:
         """Test start_scheduled sets running flag."""
         scheduler = TrendingScheduler()
         
-        with patch('schedule.every') as mock_schedule:
-            with patch('schedule.run_pending'):
+        with patch.object(scheduler.scheduler, 'every') as mock_schedule:
+            mock_job = MagicMock()
+            mock_schedule.return_value.hours.return_value.do.return_value = mock_job
+            with patch.object(scheduler.scheduler, 'run_pending'):
                 with patch('time.sleep'):
                     # Make it exit immediately
                     def sleep_side_effect(seconds):

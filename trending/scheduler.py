@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import signal
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Callable
@@ -59,6 +60,9 @@ class TrendingScheduler:
 
     def _setup_signal_handlers(self) -> None:
         """Setup signal handlers for graceful shutdown."""
+        if threading.current_thread() is not threading.main_thread():
+            logger.warning("Signal handlers can only be set from the main thread. Skipping signal handler setup.")
+            return
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
 
