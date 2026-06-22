@@ -151,3 +151,97 @@ def test_api_invalid_action():
     )
     assert response.status_code == 400
     assert "Invalid action" in response.json()["detail"]
+
+
+@pytest.mark.anyio
+async def test_consumer_redis_loop_success():
+    """Test that a message is successfully processed and acknowledged in Redis stream loop."""
+    mock_handler = MagicMock()
+    mock_redis = MagicMock()
+    
+    consumer = FeedbackConsumer(handler=mock_handler)
+    consumer.redis_client = mock_redis
+    consumer.running = True
+    
+    payload = {"user_id": "u1", "repo_id": "r1", "action": "like"}
+    mock_redis.xreadgroup.return_value = [("feedback_stream", [("msg_1", payload)])]
+    mock_redis.exists.return_value = False  # Not processed yet
+    
+    def mock_xack(*args, **kwargs):
+        consumer.running = False
+        return 1
+    mock_redis.xack.side_effect = mock_xack
+    
+    await consumer._redis_consume_loop()
+    
+    # Verify handle_feedback was called
+    mock_handler.handle_feedback.assert_called_once_with("u1", "r1", "like")
+    # Verify key was set in redis
+    mock_redis.set.assert_called_once_with("feedback:processed:msg_1", "1", ex=86400)
+    # Verify xack was called
+    mock_redis.xack.assert_called_once_with("feedback_stream", "feedback_group", "msg_1")
+
+
+@pytest.mark.anyio
+async def test_consumer_redis_loop_already_processed():
+    """Test that if a message was already processed, it skips processing and just acknowledges."""
+    mock_handler = MagicMock()
+    mock_redis = MagicMock()
+    
+    consumer = FeedbackConsumer(handler=mock_handler)
+    consumer.redis_client = mock_redis
+    consumer.running = True
+    
+    payload = {"user_id": "u1", "repo_id": "r1", "action": "like"}
+    mock_redis.xreadgroup.return_value = [("feedback_stream", [("msg_1", payload)])]
+    mock_redis.exists.return_value = True  # Already processed!
+    
+    def mock_xack(*args, **kwargs):
+        consumer.running = False
+        return 1
+    mock_redis.xack.side_effect = mock_xack
+    
+    await consumer._redis_consume_loop()
+    
+    # Verify handle_feedback was NOT called since it was already processed
+    mock_handler.handle_feedback.assert_not_called()
+    # Verify set was NOT called
+    mock_redis.set.assert_not_called()
+    # Verify xack was still called to clean up
+    mock_redis.xack.assert_called_once_with("feedback_stream", "feedback_group", "msg_1")
+
+
+@pytest.mark.anyio
+async def test_consumer_redis_loop_retry_ack():
+    """Test that if acknowledgement fails with a transient error, it retries and succeeds."""
+    mock_handler = MagicMock()
+    mock_redis = MagicMock()
+    
+    consumer = FeedbackConsumer(handler=mock_handler)
+    consumer.redis_client = mock_redis
+    consumer.running = True
+    
+    payload = {"user_id": "u1", "repo_id": "r1", "action": "like"}
+    mock_redis.xreadgroup.return_value = [("feedback_stream", [("msg_1", payload)])]
+    mock_redis.exists.return_value = False
+    
+    call_count = 0
+    def mock_xack_with_failures(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count < 3:
+            raise Exception("Transient Redis connection error")
+        consumer.running = False
+        return 1
+    mock_redis.xack.side_effect = mock_xack_with_failures
+    
+    with patch("asyncio.sleep", AsyncMock()) as mock_sleep:
+        await consumer._redis_consume_loop()
+        assert mock_sleep.call_count == 2
+        
+    mock_handler.handle_feedback.assert_called_once_with("u1", "r1", "like")
+    # Verify set was called
+    mock_redis.set.assert_called_once_with("feedback:processed:msg_1", "1", ex=86400)
+    # xack called 3 times total
+    assert mock_redis.xack.call_count == 3
+

@@ -169,8 +169,16 @@ class FeedbackHandler:
             user_vector = None
             vector_name = None
             if isinstance(user_point.vector, dict):
-                vector_name = TARGET_VECTOR_NAME or list(user_point.vector.keys())[0]
-                user_vector = list(user_point.vector[vector_name])
+                if TARGET_VECTOR_NAME and TARGET_VECTOR_NAME in user_point.vector:
+                    vector_name = TARGET_VECTOR_NAME
+                    user_vector = list(user_point.vector[vector_name])
+                else:
+                    vectors = list(user_point.vector.values())
+                    if not vectors:
+                        logger.error("User '%s' has an empty named-vector dict in Qdrant.", user_id)
+                        return False
+                    vector_name = list(user_point.vector.keys())[0]
+                    user_vector = list(vectors[0])
             else:
                 user_vector = list(user_point.vector)
 
