@@ -262,7 +262,17 @@ class RetrievalEngine:
 
         # Extract skills from payload (used by the ranker's skill_match feature)
         payload = point.payload or {}
-        skills = payload.get("skills", []) + payload.get("tech_stack", [])
+        skills_raw = payload.get("skills") or []
+        tech_raw = payload.get("tech_stack") or []
+        if isinstance(skills_raw, str):
+            skills_raw = [skills_raw]
+        if not isinstance(skills_raw, list):
+            skills_raw = list(skills_raw) if isinstance(skills_raw, (tuple, set)) else []
+        if isinstance(tech_raw, str):
+            tech_raw = [tech_raw]
+        if not isinstance(tech_raw, list):
+            tech_raw = list(tech_raw) if isinstance(tech_raw, (tuple, set)) else []
+        skills = skills_raw + tech_raw
 
         return user_vector, skills
 

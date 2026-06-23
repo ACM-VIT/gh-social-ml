@@ -260,7 +260,7 @@ class CandidateRetriever:
         if quota <= 0:
             return []
 
-        if not self.db.enabled:
+        if self.db is None or not self.db.enabled:
             logger.warning("PostgreSQL connector disabled. Trending channel returns empty.")
             return []
 
@@ -325,7 +325,7 @@ class CandidateRetriever:
             for row in rows:
                 full_name = row[0]
                 results.append({
-                    "repo_id": None,  # trending_repositories has no shared UUID with Repo
+                    "repo_id": full_name,  # Fall back to full_name as the identifier
                     "full_name": full_name,
                     "star_count": row[1] or 0,
                     "daily_stars": row[2] or 0,
@@ -563,7 +563,7 @@ class CandidateRetriever:
         (e.g. newly trending repos not yet ingested by the main pipeline), it
         performs a supplementary lookup in ``trending_repositories``.
         """
-        if not full_names or not self.db.enabled:
+        if not full_names or self.db is None or not self.db.enabled:
             return {}
 
         conn = None
@@ -654,7 +654,7 @@ class CandidateRetriever:
                     except Exception:
                         topics = []
                 result_map[full_name] = {
-                    "repo_id": None,
+                    "repo_id": full_name,
                     "github_repo_url": row[7] or f"https://github.com/{full_name}",
                     "full_name": full_name,
                     "description": row[1] or "",

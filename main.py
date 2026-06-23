@@ -403,7 +403,10 @@ if __name__ == "__main__":
             for user in MOCK_USERS:
                 onboard_user(user_id=user["user_id"], user_data=user)
 
-            engine = RetrievalEngine()
+            engine = RetrievalEngine(
+                qdrant_url=args.qdrant_url,
+                qdrant_api_key=args.qdrant_api_key,
+            )
 
             print("\n" + "═" * 80)
             print("         INTEGRATED L1 RETRIEVAL & L2 MMoE RANKING DEMO")
