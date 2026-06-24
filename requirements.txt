@@ -15,3 +15,6 @@ pytest-mock
 pytest-docker
 
 # docker in your system
+
+fastapi
+uvicorn
