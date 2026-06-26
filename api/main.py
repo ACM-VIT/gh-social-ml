@@ -277,7 +277,8 @@ async def embed_repo(request: EmbedRepoRequest):
         )
 
     payload = {
-        "id": request.github_repo,
+        "id": request.repo_id,
+        "full_name": request.github_repo,
         "repo_id": request.repo_id,
         "html_url": request.github_repo_url,
         "description": request.description or "",

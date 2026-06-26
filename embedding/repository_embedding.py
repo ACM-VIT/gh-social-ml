@@ -104,7 +104,7 @@ def coerce_payload(source: Any) -> dict[str, Any]:
 def build_metadata_text(repo: Mapping[str, Any]) -> str:
     """Project structured repository metadata into stable embedding text."""
     lines = [
-        f"Repository: {repo.get('id', '')}",
+        f"Repository: {repo.get('full_name') or repo.get('id', '')}",
         f"Description: {repo.get('description') or ''}",
         f"Primary language: {repo.get('primary_language') or 'Unknown'}",
         f"Stars: {int(repo.get('star_count') or 0)}",
