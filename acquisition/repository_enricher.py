@@ -10,6 +10,7 @@ import logging
 
 from .github_graphql_client import GitHubGraphQLClient
 from utils.readme_processor import ReadmeDocument, process_readme_payload, process_markdown
+from utils.gemma_client import generate_readme_markdown
 
 logger = logging.getLogger(__name__)
 
@@ -114,9 +115,12 @@ class RepositoryEnricher:
 
             if readme_text:
                 readme = process_markdown(readme_text)
+                if readme.clean_text:
+                    readme.readme_markdown = generate_readme_markdown(readme.clean_text)
                 # Patch the result with the real README data
                 result.readme = readme
                 result.payload["readme_length"] = readme.readme_length
+                result.payload["readme_markdown"] = readme.readme_markdown
                 result.payload["extracted_paragraphs"] = readme.extracted_paragraphs
                 result.payload["readme_to_codebase_ratio"] = self._readme_to_codebase_ratio(
                     readme.readme_length, int(result.raw_repository.get("size") or 0)
@@ -178,6 +182,8 @@ class RepositoryEnricher:
             "encoding": "base64"
         } if readme_text else None
         readme = process_readme_payload(readme_payload)
+        if readme.clean_text:
+            readme.readme_markdown = generate_readme_markdown(readme.clean_text)
 
         # Star history and events approximation
         stargazers = [{"starred_at": edge.get("starredAt")} for edge in data.get("stargazers", {}).get("edges", [])]
@@ -267,6 +273,7 @@ class RepositoryEnricher:
             "star_count": int(repository.get("stargazers_count") or repository.get("watchers_count") or 0),
             "primary_language": primary_language or "Unknown",
             "readme_length": readme.readme_length,
+            "readme_markdown": readme.readme_markdown,
             "readme_to_codebase_ratio": self._readme_to_codebase_ratio(readme.readme_length, size_kb),
             "mentionable_users_count": self._mentionable_users_count(contributors, repository),
             "delta_3d": deltas[3],

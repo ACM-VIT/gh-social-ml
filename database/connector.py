@@ -38,6 +38,25 @@ class PostgreSQLConnector:
     Automatically detects whether the target is a local PostgreSQL instance
     or a Supabase-hosted database and configures SSL accordingly.
     """
+    _migration_columns = [
+        ("owner_id", "VARCHAR(100)"),
+        ("repo_name", "VARCHAR(200)"),
+        ("full_name", "VARCHAR(255)"),
+        ("description", "TEXT"),
+        ("primary_language", "VARCHAR(50)"),
+        ("language_used", "JSONB DEFAULT '[]'::jsonb"),
+        ("topics", "JSONB DEFAULT '[]'::jsonb"),
+        ("readme_summary", "TEXT"),
+        ("readme_markdown", "TEXT"),
+        ("star_count", "INT DEFAULT 0"),
+        ("forks_count", "INT DEFAULT 0"),
+        ("pr_count", "INT DEFAULT 0"),
+        ("likes_count", "INT DEFAULT 0"),
+        ("comments_count", "INT DEFAULT 0"),
+        ("saves_count", "INT DEFAULT 0"),
+        ("views_count", "INT DEFAULT 0"),
+    ]
+
 
     def __init__(self, database_url: str | None = None) -> None:
         self.database_url = database_url or os.getenv("DATABASE_URL")
@@ -222,6 +241,7 @@ class PostgreSQLConnector:
                 language_used JSONB DEFAULT '[]'::jsonb,
                 topics JSONB DEFAULT '[]'::jsonb,
                 readme_summary TEXT,
+                readme_markdown TEXT,
                 star_count INT DEFAULT 0,
                 likes_count INT DEFAULT 0,
                 comments_count INT DEFAULT 0,
@@ -257,6 +277,7 @@ class PostgreSQLConnector:
                     language_used JSONB DEFAULT '[]'::jsonb,
                     topics JSONB DEFAULT '[]'::jsonb,
                     readme_summary TEXT,
+                    readme_markdown TEXT,
                     star_count INT DEFAULT 0,
                     likes_count INT DEFAULT 0,
                     comments_count INT DEFAULT 0,
@@ -271,26 +292,7 @@ class PostgreSQLConnector:
                 cursor.execute(fallback_table_query)
                 conn.commit()
 
-            # Add columns that may be missing from older schema versions
-            # (safe — ALTER TABLE ADD IF NOT EXISTS avoids errors on columns that already exist)
-            _migration_columns = [
-                ("owner_id", "VARCHAR(100)"),
-                ("repo_name", "VARCHAR(200)"),
-                ("full_name", "VARCHAR(255)"),
-                ("description", "TEXT"),
-                ("primary_language", "VARCHAR(50)"),
-                ("language_used", "JSONB DEFAULT '[]'::jsonb"),
-                ("topics", "JSONB DEFAULT '[]'::jsonb"),
-                ("readme_summary", "TEXT"),
-                ("star_count", "INT DEFAULT 0"),
-                ("forks_count", "INT DEFAULT 0"),
-                ("pr_count", "INT DEFAULT 0"),
-                ("likes_count", "INT DEFAULT 0"),
-                ("comments_count", "INT DEFAULT 0"),
-                ("saves_count", "INT DEFAULT 0"),
-                ("views_count", "INT DEFAULT 0"),
-            ]
-            for col_name, col_def in _migration_columns:
+            for col_name, col_def in self._migration_columns:
                 try:
                     cursor.execute(
                         f"ALTER TABLE Repo ADD COLUMN IF NOT EXISTS {col_name} {col_def};"
@@ -344,11 +346,11 @@ class PostgreSQLConnector:
             INSERT INTO Repo (
                 repo_id, github_repo_url, owner_id, repo_name, full_name, description,
                 primary_language, language_used, topics, readme_summary,
-                star_count, forks_count, pr_count
+                readme_markdown, star_count, forks_count, pr_count
             ) VALUES (
                 %s, %s, %s, %s, %s, %s, %s,
                 CAST(%s AS jsonb), CAST(%s AS jsonb),
-                %s, %s, %s, %s
+                %s, %s, %s, %s, %s
             )
             ON CONFLICT (github_repo_url) DO UPDATE SET
                 owner_id = EXCLUDED.owner_id,
@@ -359,6 +361,7 @@ class PostgreSQLConnector:
                 language_used = EXCLUDED.language_used,
                 topics = EXCLUDED.topics,
                 readme_summary = EXCLUDED.readme_summary,
+                readme_markdown = EXCLUDED.readme_markdown,
                 star_count = EXCLUDED.star_count,
                 forks_count = EXCLUDED.forks_count,
                 pr_count = EXCLUDED.pr_count,
@@ -386,6 +389,8 @@ class PostgreSQLConnector:
                 readme_text = getattr(r.readme, "clean_text", "") or ""
                 readme_summary = readme_text[:5000]
 
+                readme_markdown = getattr(r.readme, "readme_markdown", "") or ""
+
                 star_count = int(p.get("star_count") or 0)
                 forks_count = int(p.get("fork_count") or 0)
                 pr_count = int(raw.get("pull_requests_count") or 0)
@@ -405,6 +410,7 @@ class PostgreSQLConnector:
                     languages_json,
                     topics_json,
                     readme_summary,
+                    readme_markdown,
                     star_count,
                     forks_count,
                     pr_count,
