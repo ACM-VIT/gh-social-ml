@@ -12,3 +12,13 @@ venv/
 # Local testing and verification scripts
 custom_test_users.json
 verify_app.ps1
+
+# Docker and deployment configurations (kept local-only)
+Dockerfile
+docker-compose.prod.yml
+dvc.yaml
+monitoring/
+
+# Output verification files
+open_multi_agent_readme.md
+
