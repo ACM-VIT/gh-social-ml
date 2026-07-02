@@ -76,6 +76,7 @@ class FeedbackRequest(BaseModel):
 
 class RecommendationRequest(BaseModel):
     user_id: str = Field(..., min_length=1, description="Application user UUID")
+    is_cold_start: bool = Field(default=False, description="True if user has zero interactions")
 
 
 class OnboardingRequest(BaseModel):
@@ -214,6 +215,7 @@ async def generate_recommendations(request: RecommendationRequest):
         batches = await run_in_threadpool(
             retrieval_engine.fetch_onboarding_batches,
             request.user_id,
+            is_cold_start=request.is_cold_start,
         )
         return {
             "status": "success",

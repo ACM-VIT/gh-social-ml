@@ -169,7 +169,9 @@ class RetrievalEngine:
 
     # ── Core public API ───────────────────────────────────────────────────────
 
-    def fetch_onboarding_batches(self, user_id: str) -> dict[str, list[dict[str, Any]]]:
+    def fetch_onboarding_batches(
+        self, user_id: str, *, is_cold_start: bool = False
+    ) -> dict[str, list[dict[str, Any]]]:
         """Generate (or return cached) ranked recommendation batches for a user.
 
         Returns
@@ -186,7 +188,23 @@ class RetrievalEngine:
             return cached
 
         # ── 2. Get user profile from Qdrant ───────────────────────────────────
-        user_vector, user_skills = self._get_user_profile(user_id)
+        try:
+            user_vector, user_skills = self._get_user_profile(user_id)
+        except Exception as exc:
+            # This catches both ValueError (user not in Qdrant) and
+            # connection errors (Qdrant not running at all).
+            logger.warning(
+                "User '%s' Qdrant lookup failed (%s). Falling back to DB skills.", 
+                user_id, type(exc).__name__
+            )
+            user_vector = []
+            user_skills = self._get_user_skills_from_db(user_id)
+            # Force cold start pipeline if we completely lose Qdrant,
+            # as semantic ranking requires a valid vector anyway.
+            is_cold_start = True
+
+        if is_cold_start:
+            return self._cold_start_pipeline(user_id, user_vector, user_skills)
 
         # ── 3. Retrieve candidate pool (Semantic + Trending) ──────────────────
         start_retrieval = time.time()
@@ -205,8 +223,7 @@ class RetrievalEngine:
             "batch_3": ranked[BATCH_SIZE * 2: BATCH_SIZE * 3],
         }
 
-        # ── 6. Persist to Postgres ────────────────────────────────────────────
-        self._persist_batches(user_id, batches)
+        # ── 6. Return to Backend for Redis Caching ────────────────────────────
 
         logger.info(
             "Generated onboarding batches for '%s': %d / %d / %d items.",
@@ -223,7 +240,294 @@ class RetrievalEngine:
         )
         return batches
 
+    # ── Cold Start ────────────────────────────────────────────────────────────
+
+    def _cold_start_pipeline(
+        self, user_id: str, user_vector: list[float], user_skills: list[str]
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Dedicated retrieval and ranking pathway for new users with 0 interactions."""
+        import time
+
+        logger.info("Executing Cold Start pipeline for user '%s'", user_id)
+        start_retrieval = time.time()
+        
+        candidates = self._retrieve_cold_start_candidates(user_skills)
+        retrieval_latency = (time.time() - start_retrieval) * 1000.0
+
+        start_ranking = time.time()
+        ranked = self._score_cold_start_candidates(user_skills, candidates)
+        ranking_latency = (time.time() - start_ranking) * 1000.0
+
+        batches = {
+            "batch_1": ranked[0:BATCH_SIZE],
+            "batch_2": ranked[BATCH_SIZE : BATCH_SIZE * 2],
+            "batch_3": ranked[BATCH_SIZE * 2 : BATCH_SIZE * 3],
+        }
+
+
+
+        logger.info(
+            "Generated Cold Start batches for '%s': %d / %d / %d items.",
+            user_id,
+            len(batches["batch_1"]),
+            len(batches["batch_2"]),
+            len(batches["batch_3"]),
+        )
+        logger.info(
+            "Cold Start Latency: Retrieval = %.2fms, Scoring = %.2fms (Total = %.2fms)",
+            retrieval_latency,
+            ranking_latency,
+            retrieval_latency + ranking_latency,
+        )
+        return batches
+
+    def _retrieve_cold_start_candidates(self, user_skills: list[str]) -> list[dict[str, Any]]:
+        """Query Postgres for high-quality skill-matched repos + trending fallbacks."""
+        from retrieval.config import COLD_START_SKILL_MATCH_LIMIT, COLD_START_TRENDING_LIMIT, COLD_START_MIN_STARS
+        import json
+
+        if not self.db or not self.db.enabled:
+            logger.warning("Database unavailable. Cold start retrieval returning empty.")
+            return []
+
+        conn = None
+        candidates = []
+        seen_repos = set()
+
+        # Normalise skills to lower-case for better matching
+        skills_lower = [s.lower() for s in user_skills]
+
+        try:
+            conn = self.db.connect()
+            cursor = conn.cursor()
+
+            # 1. Skill-matched query on Repo table
+            if skills_lower:
+                query = """
+                SELECT repo_id, full_name, description, repo_name,
+                       language_used, topics, readme_summary, star_count,
+                       forks_count, github_repo_url
+                FROM repo
+                WHERE (
+                    EXISTS (
+                        SELECT 1 FROM jsonb_array_elements_text(topics) AS t
+                        WHERE LOWER(t) = ANY(%s)
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM (
+                            SELECT jsonb_object_keys(language_used) AS l WHERE jsonb_typeof(language_used) = 'object'
+                            UNION ALL
+                            SELECT jsonb_array_elements_text(language_used) AS l WHERE jsonb_typeof(language_used) = 'array'
+                        ) sub WHERE LOWER(sub.l) = ANY(%s)
+                    )
+                )
+                AND star_count >= %s
+                ORDER BY star_count DESC
+                LIMIT %s;
+                """
+                cursor.execute(
+                    query,
+                    (skills_lower, skills_lower, COLD_START_MIN_STARS, COLD_START_SKILL_MATCH_LIMIT),
+                )
+                columns = [
+                    "repo_id", "full_name", "description", "repo_name",
+                    "language_used", "topics", "readme_summary", "star_count",
+                    "forks_count", "github_repo_url"
+                ]
+                for row in cursor.fetchall():
+                    row_dict = dict(zip(columns, row))
+                    if row_dict["full_name"] not in seen_repos:
+                        seen_repos.add(row_dict["full_name"])
+                        langs = row_dict["language_used"]
+                        if isinstance(langs, str):
+                            try:
+                                langs = json.loads(langs)
+                            except Exception:
+                                langs = []
+                        if not isinstance(langs, list):
+                            langs = []
+                        candidates.append({
+                            "repo_id": str(row_dict["repo_id"]),
+                            "full_name": row_dict["full_name"],
+                            "repo_name": row_dict["repo_name"],
+                            "github_repo_url": row_dict["github_repo_url"],
+                            "description": row_dict["description"],
+                            "primary_language": langs[0] if langs else "Unknown",
+                            "languages": langs,
+                            "topics": row_dict["topics"] if isinstance(row_dict["topics"], list) else [],
+                            "star_count": row_dict["star_count"],
+                            "forks_count": row_dict["forks_count"],
+                            "source": "cold_start_skills",
+                        })
+
+            # 2. Supplemental trending query
+            if len(candidates) < (BATCH_SIZE * NUM_BATCHES):
+                remaining_needed = (BATCH_SIZE * NUM_BATCHES) - len(candidates)
+                trending_limit = max(COLD_START_TRENDING_LIMIT, remaining_needed)
+                
+                query_trending = """
+                SELECT full_name, description, primary_language, topics,
+                       star_count, fork_count, url
+                FROM trending_repositories
+                ORDER BY trending_rank ASC
+                LIMIT %s;
+                """
+                cursor.execute(query_trending, (trending_limit,))
+                for row in cursor.fetchall():
+                    full_name = row[0]
+                    if full_name not in seen_repos:
+                        seen_repos.add(full_name)
+                        topics = row[3]
+                        if isinstance(topics, str):
+                            try:
+                                topics = json.loads(topics)
+                            except Exception:
+                                topics = []
+                        candidates.append({
+                            "repo_id": full_name,
+                            "full_name": full_name,
+                            "github_repo_url": row[6] or f"https://github.com/{full_name}",
+                            "description": row[1] or "",
+                            "primary_language": row[2] or "Unknown",
+                            "topics": topics or [],
+                            "languages": [],
+                            "star_count": row[4] or 0,
+                            "forks_count": row[5] or 0,
+                            "source": "cold_start_trending",
+                        })
+
+            # 3. Ultimate Fallback (Any Local Repos)
+            if len(candidates) < (BATCH_SIZE * NUM_BATCHES):
+                remaining_needed = (BATCH_SIZE * NUM_BATCHES) - len(candidates)
+                query_any = """
+                SELECT repo_id, full_name, description, repo_name,
+                       language_used, topics, readme_summary, star_count,
+                       forks_count, github_repo_url
+                FROM repo
+                ORDER BY RANDOM()
+                LIMIT %s;
+                """
+                cursor.execute(query_any, (remaining_needed,))
+                columns = [
+                    "repo_id", "full_name", "description", "repo_name",
+                    "language_used", "topics", "readme_summary", "star_count",
+                    "forks_count", "github_repo_url"
+                ]
+                for row in cursor.fetchall():
+                    row_dict = dict(zip(columns, row))
+                    if row_dict["full_name"] not in seen_repos:
+                        seen_repos.add(row_dict["full_name"])
+                        langs = row_dict["language_used"]
+                        if isinstance(langs, str):
+                            try:
+                                langs = json.loads(langs)
+                            except Exception:
+                                langs = []
+                        if not isinstance(langs, list):
+                            langs = []
+                        candidates.append({
+                            "repo_id": str(row_dict["repo_id"]),
+                            "full_name": row_dict["full_name"],
+                            "repo_name": row_dict["repo_name"],
+                            "github_repo_url": row_dict["github_repo_url"],
+                            "description": row_dict["description"],
+                            "primary_language": langs[0] if langs else "Unknown",
+                            "languages": langs,
+                            "topics": row_dict["topics"] if isinstance(row_dict["topics"], list) else [],
+                            "star_count": row_dict["star_count"],
+                            "forks_count": row_dict["forks_count"],
+                            "source": "cold_start_fallback",
+                        })
+
+            return candidates
+
+        except Exception as exc:
+            logger.error("Cold start retrieval failed: %s", exc)
+            return candidates
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _score_cold_start_candidates(
+        self, user_skills: list[str], candidates: list[dict]
+    ) -> list[dict]:
+        """Deterministically score candidates based on skill match and popularity."""
+        import math
+        from retrieval.config import COLD_START_SKILL_WEIGHT, COLD_START_STARS_WEIGHT
+
+        if not candidates:
+            return []
+
+        max_log_stars = math.log1p(500_000)  # normalisation ceiling
+        user_set = {s.lower() for s in user_skills}
+
+        for c in candidates:
+            # --- Skill match ratio (0.0 to 1.0) ---
+            repo_signals = set()
+            lang = c.get("primary_language", "")
+            if lang and lang != "Unknown":
+                repo_signals.add(lang.lower())
+            
+            for t in (c.get("topics") or []):
+                repo_signals.add(str(t).lower())
+            
+            for l in (c.get("languages") or []):
+                # if language_used was a dict mapped to bytes, handle appropriately, 
+                # but typically frontend/backend uses strings or lists
+                repo_signals.add(str(l).lower())
+
+            overlap = len(repo_signals & user_set)
+            skill_match = overlap / max(len(user_set), 1)
+
+            # --- Normalised star popularity (0.0 to 1.0) ---
+            stars = int(c.get("star_count") or 0)
+            norm_stars = min(math.log1p(stars) / max_log_stars, 1.0)
+
+            # --- Final cold-start score ---
+            c["final_score"] = (COLD_START_SKILL_WEIGHT * skill_match) + (COLD_START_STARS_WEIGHT * norm_stars)
+            c["score_source"] = "cold_start"
+            # MMoE fields fallback so UI doesn't break
+            c["predictions"] = {
+                "p_ctr": skill_match,
+                "p_save": norm_stars,
+                "p_follow": 0.0,
+                "pred_dwell_fraction": 0.5,
+            }
+
+        candidates.sort(key=lambda x: x.get("final_score", 0), reverse=True)
+        return candidates
+
     # ── User profile retrieval ────────────────────────────────────────────────
+
+    def _get_user_skills_from_db(self, user_id: str) -> list[str]:
+        """Fallback to retrieve user skills directly from Postgres if Qdrant is missing."""
+        if not self.db or not self.db.enabled:
+            return []
+        conn = None
+        try:
+            conn = self.db.connect()
+            cursor = conn.cursor()
+            cursor.execute("SELECT skills, tech_stack FROM users WHERE user_id = %s;", (user_id,))
+            row = cursor.fetchone()
+            if not row:
+                return []
+            
+            import json
+            skills = row[0] if isinstance(row[0], list) else (json.loads(row[0]) if row[0] else [])
+            tech = row[1] if isinstance(row[1], list) else (json.loads(row[1]) if row[1] else [])
+            return skills + tech
+        except Exception as exc:
+            logger.error("Failed to get user skills from DB: %s", exc)
+            return []
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def _get_user_profile(self, user_id: str) -> tuple[list[float], list[str]]:
         """Return (interest_vector, skills_list) for a user from Qdrant.
