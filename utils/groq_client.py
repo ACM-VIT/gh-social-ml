@@ -45,7 +45,7 @@ def generate_readme_markdown(clean_text: str) -> str:
 
     api_key = os.getenv("GROQ_API_KEY")
     model = os.getenv("GROQ_MODEL_ID") or "llama-3.3-70b-versatile"
-    url = "https://api.groq.com/openai/v1/chat/completions"
+    url = os.getenv("GROQ_API_URL") or "https://api.groq.com/openai/v1/chat/completions"
 
     if not api_key:
         logger.warning(
