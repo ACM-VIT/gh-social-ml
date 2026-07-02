@@ -267,90 +267,105 @@ if __name__ == "__main__":
     else:
         logger.info("Database connector is not enabled. Ingestion/hydration will be disabled.")
 
-    target_count = 3000
+    target_count = 3500
     kept = []
 
     # ── Step 2: Fetch & Index if under target ─────────────────────────────────
-    # If database is enabled and connected, we target reaching target_count.
-    # Otherwise, we just fetch args.limit repositories directly.
-    if db_verified:
-        should_fetch = current_count < target_count
-        fetch_limit = min(target_count - current_count, args.limit)
-    else:
-        should_fetch = True
-        fetch_limit = args.limit
-
-    if not should_fetch:
-        logger.info(f"Approved corpus has {current_count} repositories (>= {target_count}). Skipping new repository acquisition.")
-    else:
+    while True:
+        # If database is enabled and connected, we target reaching target_count.
+        # Otherwise, we just fetch args.limit repositories directly.
         if db_verified:
-            logger.info(f"Approved corpus has {current_count} repositories. Fetching up to {fetch_limit} repositories to reach the {target_count} target...")
+            should_fetch = current_count < target_count
+            fetch_limit = min(target_count - current_count, args.limit)
         else:
-            logger.info(f"Database ingestion is disabled. Fetching exactly {fetch_limit} repositories for local execution...")
+            should_fetch = True
+            fetch_limit = args.limit
 
-        # Load existing repos to filter out duplicates in run_acquisition
-        existing_repos = set()
-        if db.enabled and db_verified:
-            conn = None
-            try:
-                conn = db.connect()
-                cursor = conn.cursor()
-                cursor.execute("SELECT full_name FROM Repo;")
-                existing_repos = {row[0] for row in cursor.fetchall()}
-                logger.info(f"Loaded {len(existing_repos)} existing repository names from database.")
-            except Exception as e:
-                logger.warning(f"Could not fetch existing repository names: {e}")
-            finally:
-                if conn:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
+        if not should_fetch:
+            logger.info(f"Approved corpus has {current_count} repositories (>= {target_count}). Skipping new repository acquisition.")
+            break
+        else:
+            if db_verified:
+                logger.info(f"Approved corpus has {current_count} repositories. Fetching up to {fetch_limit} repositories to reach the {target_count} target...")
+            else:
+                logger.info(f"Database ingestion is disabled. Fetching exactly {fetch_limit} repositories for local execution...")
 
-        enriched = run_acquisition(token, limit=fetch_limit, batch_size=args.batch_size, workers=args.workers, existing_repos=existing_repos)
-        kept, dropped = filter_enriched(enriched, min_readme_chars=args.min_readme_chars)
+            # Load existing repos to filter out duplicates in run_acquisition
+            existing_repos = set()
+            if db.enabled and db_verified:
+                conn = None
+                try:
+                    conn = db.connect()
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT full_name FROM Repo;")
+                    existing_repos = {row[0] for row in cursor.fetchall()}
+                    logger.info(f"Loaded {len(existing_repos)} existing repository names from database.")
+                except Exception as e:
+                    logger.warning(f"Could not fetch existing repository names: {e}")
+                finally:
+                    if conn:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
 
-        logger.info(
-            "Quality filter: %d kept, %d dropped  (min_readme_chars=%d)",
-            len(kept), len(dropped), args.min_readme_chars,
-        )
+            enriched = run_acquisition(token, limit=fetch_limit, batch_size=args.batch_size, workers=args.workers, existing_repos=existing_repos)
+            if not enriched:
+                logger.warning("No new repositories acquired in this iteration. Stopping to avoid infinite loop.")
+                break
 
-        _print_summary(kept, dropped)
+            kept, dropped = filter_enriched(enriched, min_readme_chars=args.min_readme_chars)
 
-        # PostgreSQL Ingestion (First to ensure consistency and prevent orphaned points in Qdrant)
-        db_ingestion_success = False
-        if kept and db_verified:
-            try:
-                saved_count = db.upsert_repositories(kept)
-                current_count = db.get_repo_count()
-                logger.info(
-                    f"Database ingestion complete: {saved_count} upserted this run, "
-                    f"{current_count} total repos in database."
-                )
+            logger.info(
+                "Quality filter: %d kept, %d dropped  (min_readme_chars=%d)",
+                len(kept), len(dropped), args.min_readme_chars,
+            )
+
+            _print_summary(kept, dropped)
+
+            if not kept:
+                logger.warning("No repositories passed the quality filter. Stopping to avoid infinite reacquisition loop.")
+                break
+
+            # PostgreSQL Ingestion (First to ensure consistency and prevent orphaned points in Qdrant)
+            db_ingestion_success = False
+            if kept and db_verified:
+                try:
+                    saved_count = db.upsert_repositories(kept)
+                    current_count = db.get_repo_count()
+                    logger.info(
+                        f"Database ingestion complete: {saved_count} upserted this run, "
+                        f"{current_count} total repos in database."
+                    )
+                    db_ingestion_success = True
+                except Exception as db_exc:
+                    logger.error(f"Failed to ingest repositories into database: {db_exc}")
+                    break
+            elif kept and not db_verified:
+                # If DB is not enabled/verified, treat as success to proceed with Qdrant indexing
                 db_ingestion_success = True
-            except Exception as db_exc:
-                logger.error(f"Failed to ingest repositories into database: {db_exc}")
-        elif kept and not db_verified:
-            # If DB is not enabled/verified, treat as success to proceed with Qdrant indexing
-            db_ingestion_success = True
 
-        # Qdrant Indexing
-        if kept and db_ingestion_success and not args.no_index_qdrant:
-            try:
-                indexed = index_approved_repositories(
-                    kept,
-                    qdrant_url=args.qdrant_url,
-                    qdrant_api_key=args.qdrant_api_key,
-                    qdrant_collection=args.qdrant_collection,
-                    embedding_model=args.embedding_model,
-                )
-                logger.info("Qdrant indexing complete: %d repository vectors stored", len(indexed))
-            except Exception as exc:
-                logger.error("Qdrant indexing failed: %s", exc)
+            # Qdrant Indexing
+            if kept and db_ingestion_success and not args.no_index_qdrant:
+                try:
+                    indexed = index_approved_repositories(
+                        kept,
+                        qdrant_url=args.qdrant_url,
+                        qdrant_api_key=args.qdrant_api_key,
+                        qdrant_collection=args.qdrant_collection,
+                        embedding_model=args.embedding_model,
+                    )
+                    logger.info("Qdrant indexing complete: %d repository vectors stored", len(indexed))
+                except Exception as exc:
+                    logger.error("Qdrant indexing failed: %s", exc)
+                    break
+                    
+            if not db_verified:
+                break
 
     # ── Step 3: Integrated Candidate Retrieval + Ranking Demo ──────────────────
     if current_count >= target_count:
-        logger.info("Corpus target of 3000 reached. Executing Integrated Retrieval + Ranking Demo...")
+        logger.info("Corpus target of 3500 reached. Executing Integrated Retrieval + Ranking Demo...")
         try:
             from scripts.mock_users import MOCK_USERS
             from scripts.user_onboarding import onboard_user
