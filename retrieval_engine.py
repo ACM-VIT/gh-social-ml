@@ -190,9 +190,15 @@ class RetrievalEngine:
         # ── 2. Get user profile from Qdrant ───────────────────────────────────
         try:
             user_vector, user_skills = self._get_user_profile(user_id)
+        except ValueError:
+            if is_cold_start:
+                logger.info("Cold start user '%s' vector not present. Using DB skills.", user_id)
+                user_vector = []
+                user_skills = self._get_user_skills_from_db(user_id)
+            else:
+                raise
         except Exception as exc:
-            # This catches both ValueError (user not in Qdrant) and
-            # connection errors (Qdrant not running at all).
+            # Catch connection errors (Qdrant down or network failure)
             logger.warning(
                 "User '%s' Qdrant lookup failed (%s). Falling back to DB skills.", 
                 user_id, type(exc).__name__
@@ -344,7 +350,9 @@ class RetrievalEngine:
                                 langs = json.loads(langs)
                             except Exception:
                                 langs = []
-                        if not isinstance(langs, list):
+                        if isinstance(langs, dict):
+                            langs = list(langs.keys())
+                        elif not isinstance(langs, list):
                             langs = []
                         candidates.append({
                             "repo_id": str(row_dict["repo_id"]),
@@ -423,7 +431,9 @@ class RetrievalEngine:
                                 langs = json.loads(langs)
                             except Exception:
                                 langs = []
-                        if not isinstance(langs, list):
+                        if isinstance(langs, dict):
+                            langs = list(langs.keys())
+                        elif not isinstance(langs, list):
                             langs = []
                         candidates.append({
                             "repo_id": str(row_dict["repo_id"]),
