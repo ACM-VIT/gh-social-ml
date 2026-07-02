@@ -396,6 +396,49 @@ class RetrievalEngine:
                             "source": "cold_start_trending",
                         })
 
+            # 3. Ultimate Fallback (Any Local Repos)
+            if len(candidates) < (BATCH_SIZE * NUM_BATCHES):
+                remaining_needed = (BATCH_SIZE * NUM_BATCHES) - len(candidates)
+                query_any = """
+                SELECT repo_id, full_name, description, repo_name,
+                       language_used, topics, readme_summary, star_count,
+                       forks_count, github_repo_url
+                FROM repo
+                ORDER BY RANDOM()
+                LIMIT %s;
+                """
+                cursor.execute(query_any, (remaining_needed,))
+                columns = [
+                    "repo_id", "full_name", "description", "repo_name",
+                    "language_used", "topics", "readme_summary", "star_count",
+                    "forks_count", "github_repo_url"
+                ]
+                for row in cursor.fetchall():
+                    row_dict = dict(zip(columns, row))
+                    if row_dict["full_name"] not in seen_repos:
+                        seen_repos.add(row_dict["full_name"])
+                        langs = row_dict["language_used"]
+                        if isinstance(langs, str):
+                            try:
+                                langs = json.loads(langs)
+                            except Exception:
+                                langs = []
+                        if not isinstance(langs, list):
+                            langs = []
+                        candidates.append({
+                            "repo_id": str(row_dict["repo_id"]),
+                            "full_name": row_dict["full_name"],
+                            "repo_name": row_dict["repo_name"],
+                            "github_repo_url": row_dict["github_repo_url"],
+                            "description": row_dict["description"],
+                            "primary_language": langs[0] if langs else "Unknown",
+                            "languages": langs,
+                            "topics": row_dict["topics"] if isinstance(row_dict["topics"], list) else [],
+                            "star_count": row_dict["star_count"],
+                            "forks_count": row_dict["forks_count"],
+                            "source": "cold_start_fallback",
+                        })
+
             return candidates
 
         except Exception as exc:
