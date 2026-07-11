@@ -195,9 +195,11 @@ class FeedbackHandler:
             logger.warning("Failed to adjust Qdrant profile embedding for user '%s'", user_id)
 
         # 3. Invalidate the cached feed batches for this user in PostgreSQL
-        cache_success = self.invalidate_user_feed_cache(user_id)
-        if not cache_success:
-            logger.warning("Failed to invalidate feed cache for user '%s'", user_id)
+        cache_success = True
+        if state_changed and resolved_alpha != 0.0:
+            cache_success = self.invalidate_user_feed_cache(user_id)
+            if not cache_success:
+                logger.warning("Failed to invalidate feed cache for user '%s'", user_id)
 
         return db_success and qdrant_success and cache_success
 

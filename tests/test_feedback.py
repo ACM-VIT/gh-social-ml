@@ -529,6 +529,94 @@ async def test_consumer_redis_loop_retry_ack():
     
     with patch("asyncio.sleep", AsyncMock()) as mock_sleep:
         await consumer._redis_consume_loop()
+
+
+@pytest.mark.anyio
+async def test_consumer_redis_loop_success():
+    """Test that a message is successfully processed and acknowledged in Redis stream loop."""
+    mock_handler = MagicMock()
+    mock_redis = MagicMock()
+    
+    consumer = FeedbackConsumer(handler=mock_handler)
+    consumer.redis_client = mock_redis
+    consumer.running = True
+    
+    payload = {"user_id": "u1", "repo_id": "r1", "action": "like"}
+    mock_redis.xreadgroup.return_value = [("feedback_stream", [("msg_1", payload)])]
+    mock_redis.exists.return_value = False  # Not processed yet
+    
+    def mock_xack(*args, **kwargs):
+        consumer.running = False
+        return 1
+    mock_redis.xack.side_effect = mock_xack
+    
+    await consumer._redis_consume_loop()
+    
+    # Verify handle_feedback was called with new dwell_seconds kwarg (None when not in payload)
+    mock_handler.handle_feedback.assert_called_once_with(
+        "u1", "r1", "like", dwell_seconds=None
+    )
+    # Verify key was set in redis
+    mock_redis.set.assert_called_once_with("feedback:processed:msg_1", "1", ex=86400)
+    # Verify xack was called
+    mock_redis.xack.assert_called_once_with("feedback_stream", "feedback_group", "msg_1")
+
+
+@pytest.mark.anyio
+async def test_consumer_redis_loop_already_processed():
+    """Test that if a message was already processed, it skips processing and just acknowledges."""
+    mock_handler = MagicMock()
+    mock_redis = MagicMock()
+    
+    consumer = FeedbackConsumer(handler=mock_handler)
+    consumer.redis_client = mock_redis
+    consumer.running = True
+    
+    payload = {"user_id": "u1", "repo_id": "r1", "action": "like"}
+    mock_redis.xreadgroup.return_value = [("feedback_stream", [("msg_1", payload)])]
+    mock_redis.exists.return_value = True  # Already processed!
+    
+    def mock_xack(*args, **kwargs):
+        consumer.running = False
+        return 1
+    mock_redis.xack.side_effect = mock_xack
+    
+    await consumer._redis_consume_loop()
+    
+    # Verify handle_feedback was NOT called since it was already processed
+    mock_handler.handle_feedback.assert_not_called()
+    # Verify set was NOT called
+    mock_redis.set.assert_not_called()
+    # Verify xack was still called to clean up
+    mock_redis.xack.assert_called_once_with("feedback_stream", "feedback_group", "msg_1")
+
+
+@pytest.mark.anyio
+async def test_consumer_redis_loop_retry_ack():
+    """Test that if acknowledgement fails with a transient error, it retries and succeeds."""
+    mock_handler = MagicMock()
+    mock_redis = MagicMock()
+    
+    consumer = FeedbackConsumer(handler=mock_handler)
+    consumer.redis_client = mock_redis
+    consumer.running = True
+    
+    payload = {"user_id": "u1", "repo_id": "r1", "action": "like"}
+    mock_redis.xreadgroup.return_value = [("feedback_stream", [("msg_1", payload)])]
+    mock_redis.exists.return_value = False
+    
+    call_count = 0
+    def mock_xack_with_failures(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count < 3:
+            raise Exception("Transient Redis connection error")
+        consumer.running = False
+        return 1
+    mock_redis.xack.side_effect = mock_xack_with_failures
+    
+    with patch("asyncio.sleep", AsyncMock()) as mock_sleep:
+        await consumer._redis_consume_loop()
         assert mock_sleep.call_count == 2
         
     mock_handler.handle_feedback.assert_called_once_with(
@@ -539,3 +627,55 @@ async def test_consumer_redis_loop_retry_ack():
     # xack called 3 times total
     assert mock_redis.xack.call_count == 3
 
+
+def test_handler_impression_does_not_invalidate_cache():
+    """Verify that a neutral impression does not invalidate the user feed cache."""
+    mock_db = MagicMock()
+    mock_db.enabled = False
+    with patch("feedback.event_handlers.QdrantClient"):
+        handler = FeedbackHandler(db_connector=mock_db, qdrant_url="http://localhost:6333")
+    handler.store = MagicMock()
+    handler.update_postgres_metrics = MagicMock(return_value=True)
+    handler.invalidate_user_feed_cache = MagicMock(return_value=True)
+    handler.update_user_embedding = MagicMock(return_value=True)
+
+    assert handler.handle_feedback(USER_UUID, "facebook/react", "impression") is True
+    handler.invalidate_user_feed_cache.assert_not_called()
+
+
+def test_readme_open_changes_state_and_invalidates_cache():
+    """Verify that readme_open triggers a cache invalidation and state change."""
+    mock_db = MagicMock()
+    mock_db.enabled = False
+    with patch("feedback.event_handlers.QdrantClient"):
+        handler = FeedbackHandler(db_connector=mock_db, qdrant_url="http://localhost:6333")
+    handler.store = MagicMock()
+    handler.update_postgres_metrics = MagicMock(return_value=True)
+    handler.invalidate_user_feed_cache = MagicMock(return_value=True)
+    handler.update_user_embedding = MagicMock(return_value=True)
+
+    assert handler.handle_feedback(USER_UUID, "facebook/react", "readme_open") is True
+    handler.invalidate_user_feed_cache.assert_called_once_with(USER_UUID)
+    handler.update_user_embedding.assert_called_once_with(USER_UUID, "facebook/react", 0.05)
+
+
+def test_reversal_events_emit_correct_alpha():
+    """Verify that unlike and undislike trigger negative alpha shifts."""
+    mock_db = MagicMock()
+    mock_db.enabled = False
+    with patch("feedback.event_handlers.QdrantClient"):
+        handler = FeedbackHandler(db_connector=mock_db, qdrant_url="http://localhost:6333")
+    handler.store = MagicMock()
+    handler.store.delete.return_value = True
+    handler.update_postgres_metrics = MagicMock(return_value=True)
+    handler.invalidate_user_feed_cache = MagicMock(return_value=True)
+    handler.update_user_embedding = MagicMock(return_value=True)
+
+    assert handler.handle_feedback(USER_UUID, "facebook/react", "unlike") is True
+    handler.update_user_embedding.assert_called_with(USER_UUID, "facebook/react", -0.15)
+    
+    assert handler.handle_feedback(USER_UUID, "facebook/react", "undislike") is True
+    handler.update_user_embedding.assert_called_with(USER_UUID, "facebook/react", 0.15)
+
+    assert handler.handle_feedback(USER_UUID, "facebook/react", "unsave") is True
+    handler.update_user_embedding.assert_called_with(USER_UUID, "facebook/react", -0.20)
