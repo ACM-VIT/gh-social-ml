@@ -161,8 +161,12 @@ class FeedbackHandler:
         db_success = True
         if action != "dwell":
             try:
-                if interaction.clears_feedback:
-                    self.store.delete(user_id, repo_id)
+                if interaction.clears_interaction_type:
+                    self.store.delete(
+                        user_id,
+                        repo_id,
+                        interaction_type=interaction.clears_interaction_type,
+                    )
                 else:
                     self.store.record(user_id, repo_id, action, interaction.feedback_score)
             except Exception as exc:

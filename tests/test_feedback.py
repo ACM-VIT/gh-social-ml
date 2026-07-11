@@ -11,6 +11,8 @@ from feedback.producer import FeedbackProducer
 from feedback.consumer import FeedbackConsumer
 
 
+USER_UUID = "123e4567-e89b-12d3-a456-426614174000"
+
 
 def test_shift_vector_math():
     """Verify the vector shifting formula: User' + alpha * Repo, normalized to 1."""
@@ -65,7 +67,7 @@ def test_handler_like_event(mock_qdrant_cls, mock_db_cls):
     # Unnamed 384-dimensional user vector
     user_vec = [0.1] * 384
     mock_user_point.vector = user_vec
-    mock_user_point.payload = {"user_id": "test_user", "skills": ["Python"]}
+    mock_user_point.payload = {"user_id": USER_UUID, "skills": ["Python"]}
     mock_qdrant.retrieve.side_effect = [
         [mock_user_point],  # first call: user profile
         [MagicMock(vector=[0.2] * 384)]  # second call: repository
@@ -74,7 +76,7 @@ def test_handler_like_event(mock_qdrant_cls, mock_db_cls):
     handler = FeedbackHandler(db_connector=mock_db, qdrant_url="http://localhost:6333")
     
     # Process like event
-    success = handler.handle_feedback("test_user", "test-owner/test-repo", "like")
+    success = handler.handle_feedback(USER_UUID, "test-owner/test-repo", "like")
     
     assert success is True
 
@@ -124,7 +126,7 @@ def test_api_feedback_submission():
         response = client.post(
             "/api/v1/feedback",
             json={
-                "user_id": "user_123",
+                "user_id": USER_UUID,
                 "repo_id": "facebook/react",
                 "action": "like",
             },
@@ -133,7 +135,7 @@ def test_api_feedback_submission():
         assert response.json()["status"] == "accepted"
         # New signature includes dwell_seconds=None for non-dwell actions
         mock_producer.submit_feedback.assert_called_once_with(
-            user_id="user_123",
+            user_id=USER_UUID,
             repo_id="facebook/react",
             action="like",
             dwell_seconds=None,
@@ -150,7 +152,7 @@ def test_api_dwell_feedback_submission():
         response = client.post(
             "/api/v1/feedback",
             json={
-                "user_id": "user_123",
+                "user_id": USER_UUID,
                 "repo_id": "facebook/react",
                 "action": "dwell",
                 "dwell_seconds": 45.0,
@@ -161,7 +163,7 @@ def test_api_dwell_feedback_submission():
         assert data["status"] == "accepted"
         assert data["data"]["dwell_seconds"] == 45.0
         mock_producer.submit_feedback.assert_called_once_with(
-            user_id="user_123",
+            user_id=USER_UUID,
             repo_id="facebook/react",
             action="dwell",
             dwell_seconds=45.0,
@@ -175,7 +177,7 @@ def test_api_dwell_missing_dwell_seconds():
     response = client.post(
         "/api/v1/feedback",
         json={
-            "user_id": "user_123",
+            "user_id": USER_UUID,
             "repo_id": "facebook/react",
             "action": "dwell",
         },
@@ -247,13 +249,48 @@ def test_api_invalid_action():
     response = client.post(
         "/api/v1/feedback",
         json={
-            "user_id": "user_123",
+            "user_id": USER_UUID,
             "repo_id": "facebook/react",
             "action": "invalid_action",
         },
     )
     assert response.status_code == 400
     assert "Invalid action" in response.json()["detail"]
+
+
+def test_api_rejects_malformed_user_id():
+    """Verify feedback rejects user IDs that cannot persist to UUID-backed tables."""
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/feedback",
+        json={
+            "user_id": "user_123",
+            "repo_id": "facebook/react",
+            "action": "like",
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_clear_actions_only_delete_the_matching_positive_signal():
+    """unlike/unsave must not remove an unrelated effective feedback row."""
+    mock_db = MagicMock()
+    mock_db.enabled = False
+    with patch("feedback.event_handlers.QdrantClient"):
+        handler = FeedbackHandler(db_connector=mock_db, qdrant_url="http://localhost:6333")
+    handler.store = MagicMock()
+    handler.update_postgres_metrics = MagicMock(return_value=True)
+    handler.invalidate_user_feed_cache = MagicMock(return_value=True)
+
+    assert handler.handle_feedback(USER_UUID, "facebook/react", "unlike") is True
+    handler.store.delete.assert_called_once_with(
+        USER_UUID,
+        "facebook/react",
+        interaction_type="like",
+    )
+    handler.store.record.assert_not_called()
 
 
 @pytest.mark.anyio

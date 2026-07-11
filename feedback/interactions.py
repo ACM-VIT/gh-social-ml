@@ -6,7 +6,7 @@ class InteractionDefinition:
     feedback_score: float
     embedding_alpha: float
     metric_column: str | None = None
-    clears_feedback: bool = False
+    clears_interaction_type: str | None = None
 
 
 # Canonical interaction configuration. New interaction types should be added here.
@@ -14,8 +14,8 @@ INTERACTIONS: dict[str, InteractionDefinition] = {
     "like": InteractionDefinition(1.0, 0.15, "likes_count"),
     "save": InteractionDefinition(0.8, 0.20, "saves_count"),
     "dislike": InteractionDefinition(-1.0, -0.15),
-    "unlike": InteractionDefinition(0.0, 0.0, clears_feedback=True),
-    "unsave": InteractionDefinition(0.0, 0.0, clears_feedback=True),
+    "unlike": InteractionDefinition(0.0, 0.0, clears_interaction_type="like"),
+    "unsave": InteractionDefinition(0.0, 0.0, clears_interaction_type="save"),
     # Existing implicit signals remain supported with deliberately lower weight.
     "click": InteractionDefinition(0.2, 0.05, "views_count"),
     "skip": InteractionDefinition(-0.2, -0.05),

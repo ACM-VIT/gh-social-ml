@@ -1,7 +1,11 @@
 import pytest
+from unittest.mock import MagicMock
 
 from feedback.interactions import get_interaction
-from feedback.storage import apply_feedback_scores
+from feedback.storage import FeedbackStore, apply_feedback_scores
+
+
+USER_UUID = "123e4567-e89b-12d3-a456-426614174000"
 
 
 def test_initial_feedback_weights_are_centralized_and_bounded():
@@ -37,3 +41,24 @@ def test_explicit_dislike_filters_exact_repository():
     ranked = apply_feedback_scores(candidates, {"org/disliked": -1.0})
 
     assert [item["full_name"] for item in ranked] == ["org/liked"]
+
+
+def test_feedback_delete_can_target_only_one_interaction_type():
+    mock_cursor = MagicMock()
+    mock_cursor.rowcount = 1
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_db = MagicMock()
+    mock_db.enabled = True
+    mock_db._get_connection.return_value = mock_conn
+
+    deleted = FeedbackStore(mock_db).delete(
+        USER_UUID,
+        "org/repo",
+        interaction_type="like",
+    )
+
+    assert deleted is True
+    sql, params = mock_cursor.execute.call_args_list[-1][0]
+    assert "interaction_type = %s" in sql
+    assert params == (USER_UUID, "org/repo", "org/repo", "like", "like")

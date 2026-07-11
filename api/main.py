@@ -1,5 +1,6 @@
 import logging
 import os
+from uuid import UUID
 
 # Load .env FIRST — before any imports that call os.getenv() at module level
 # (e.g. scripts/user_onboarding.py reads QDRANT_URL on import)
@@ -69,7 +70,7 @@ feedback_store: FeedbackStore | None = None
 
 
 class FeedbackRequest(BaseModel):
-    user_id: str = Field(..., description="Unique ID of the user performing the action")
+    user_id: UUID = Field(..., description="Application user UUID performing the action")
     repo_id: str = Field(..., description="Full name or UUID of the repository")
     action: str = Field(
         ...,
@@ -178,7 +179,7 @@ async def submit_feedback(request: FeedbackRequest):
     try:
         # Enqueue the event (dwell_seconds is forwarded as keyword-only arg)
         success = await producer.submit_feedback(
-            user_id=request.user_id,
+            user_id=str(request.user_id),
             repo_id=request.repo_id,
             action=action,
             dwell_seconds=request.dwell_seconds,
@@ -191,7 +192,7 @@ async def submit_feedback(request: FeedbackRequest):
             )
 
         response_data: dict = {
-            "user_id": request.user_id,
+            "user_id": str(request.user_id),
             "repo_id": request.repo_id,
             "action": action,
         }

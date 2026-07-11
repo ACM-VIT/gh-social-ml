@@ -1,4 +1,5 @@
 import logging
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -6,6 +7,13 @@ from typing import Any
 from database.connector import PostgreSQLConnector
 
 logger = logging.getLogger("pipeline.feedback.storage")
+
+
+def _normalize_user_uuid(user_id: str) -> str:
+    try:
+        return str(uuid.UUID(str(user_id)))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid user_id UUID: {user_id}") from exc
 
 
 @dataclass(frozen=True)
@@ -54,6 +62,7 @@ class FeedbackStore:
     ) -> FeedbackRecord | None:
         if not -1.0 <= feedback_score <= 1.0:
             raise ValueError("feedback_score must be in the range [-1.0, 1.0]")
+        user_id = _normalize_user_uuid(user_id)
         if not self.db.enabled:
             return None
 
@@ -86,7 +95,14 @@ class FeedbackStore:
             return None
         return FeedbackRecord(*row)
 
-    def delete(self, user_id: str, repo_id: str) -> bool:
+    def delete(
+        self,
+        user_id: str,
+        repo_id: str,
+        *,
+        interaction_type: str | None = None,
+    ) -> bool:
+        user_id = _normalize_user_uuid(user_id)
         if not self.db.enabled:
             return False
         self.init_schema()
@@ -99,15 +115,17 @@ class FeedbackStore:
               AND repo_id IN (
                   SELECT repo_id FROM repo
                   WHERE repo_id::text = %s OR full_name = %s
-              );
+              )
+              AND (%s IS NULL OR interaction_type = %s);
             """,
-            (user_id, repo_id, repo_id),
+            (user_id, repo_id, repo_id, interaction_type, interaction_type),
         )
         deleted = cursor.rowcount > 0
         conn.commit()
         return deleted
 
     def list_for_user(self, user_id: str) -> list[FeedbackRecord]:
+        user_id = _normalize_user_uuid(user_id)
         if not self.db.enabled:
             return []
         self.init_schema()
