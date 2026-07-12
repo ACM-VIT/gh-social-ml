@@ -739,8 +739,8 @@ def test_unnormalized_preference_accumulator_undo_math():
         assert math.isclose(orig, restored, abs_tol=1e-5)
 
 
-def test_qdrant_failure_rolls_back_postgres_transaction():
-    """Verify that an exception in Qdrant rolls back the Postgres transaction."""
+def test_qdrant_failure_does_not_rollback_postgres_transaction():
+    """Verify that an exception in Qdrant does not roll back Postgres, as it's already committed."""
     mock_db = MagicMock()
     mock_db.enabled = True
     mock_conn = MagicMock()
@@ -759,13 +759,13 @@ def test_qdrant_failure_rolls_back_postgres_transaction():
     # Force Qdrant update to fail
     handler.update_user_embedding = MagicMock(return_value=False)
     
-    # Should catch exception and return False
+    # Should catch exception and return False to trigger retry
     res = handler.handle_feedback(USER_UUID, "facebook/react", "like")
     assert res is False
     
-    # Transaction should be rolled back
-    mock_conn.rollback.assert_called_once()
-    mock_conn.commit.assert_not_called()
+    # Transaction should NOT be rolled back, it's committed BEFORE Qdrant
+    mock_conn.commit.assert_called_once()
+    mock_conn.rollback.assert_not_called()
 
 
 def test_dislike_to_like_switch_emits_correct_sequence():
@@ -863,24 +863,4 @@ def test_transient_persistence_error_raises_for_retry():
         handler.handle_feedback(USER_UUID, "facebook/react", "like")
 
 
-def test_postgres_commit_failure_rolls_back_qdrant_vector_shift():
-    """If Postgres conn.commit() fails after Qdrant succeeds, Qdrant should be rolled back to avoid double application on retry."""
-    handler = _transition_handler()
-    handler.store = MagicMock()
-    handler.db.enabled = True
-    
-    mock_conn = MagicMock()
-    mock_conn.commit.side_effect = Exception("commit failed")
-    handler.db._get_connection = MagicMock(return_value=mock_conn)
-    handler.store.record.return_value = {"success": True}  # state_changed = True
 
-    with pytest.raises(Exception, match="commit failed"):
-        handler.handle_feedback(USER_UUID, "facebook/react", "like")
-    
-    mock_conn.rollback.assert_called()
-    
-    # Should apply +0.15 for the like, and then -0.15 for the rollback
-    assert handler.update_user_embedding.call_count == 2
-    calls = handler.update_user_embedding.call_args_list
-    assert calls[0][0][2] == 0.15
-    assert calls[1][0][2] == -0.15
