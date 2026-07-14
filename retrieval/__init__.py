@@ -1,7 +1,7 @@
 """Candidate retrieval package for gh-social-ml.
 
 Provides multi-channel L1 candidate retrieval using Qdrant semantic search
-and PostgreSQL metadata queries.
+and Qdrant-native discovery queries.
 """
 
 from .candidate_retriever import CandidateRetriever

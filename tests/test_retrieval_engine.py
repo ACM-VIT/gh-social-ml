@@ -7,10 +7,9 @@ from retrieval_engine import RetrievalEngine
 
 @pytest.fixture
 def mock_retrieval_dependencies():
-    """Mocks Qdrant, CandidateRetriever, and Postgres databases for RetrievalEngine."""
+    """Mock Qdrant and ranking dependencies for RetrievalEngine."""
     with patch("retrieval_engine.QdrantClient") as mock_qdrant_cls, \
-         patch("retrieval.CandidateRetriever") as mock_retriever_cls, \
-         patch("database.PostgreSQLConnector") as mock_db_cls:
+         patch("retrieval.CandidateRetriever") as mock_retriever_cls:
         
         mock_qdrant = MagicMock()
         mock_qdrant_cls.return_value = mock_qdrant
@@ -18,27 +17,23 @@ def mock_retrieval_dependencies():
         mock_retriever = MagicMock()
         mock_retriever_cls.return_value = mock_retriever
         
-        mock_db = MagicMock()
-        mock_db.enabled = True
-        mock_db_cls.return_value = mock_db
-        
-        yield mock_qdrant, mock_retriever, mock_db
+        yield mock_qdrant, mock_retriever
 
 
 def test_retrieval_engine_lazy_loading(mock_retrieval_dependencies):
-    """Verify that RankerService and PostgreSQLConnector are loaded lazily."""
-    _, _, _ = mock_retrieval_dependencies
+    """Verify that online retrieval dependencies are loaded lazily."""
+    _, _ = mock_retrieval_dependencies
     
     engine = RetrievalEngine(qdrant_url="http://localhost:6333")
     
     # Internal references should start as None/unloaded
-    assert engine._db is None
+    assert engine._candidate_retriever is None
     assert engine._ranker is None
     
     # Trigger lazy loading properties
-    db = engine.db
-    assert db is not None
-    assert engine._db is not None
+    retriever = engine.candidate_retriever
+    assert retriever is not None
+    assert engine._candidate_retriever is not None
     
     # Mocking RankerService instantiation to avoid loading actual torch weights in unit tests
     with patch("inference.ranker_service.RankerService") as mock_ranker_cls:
@@ -49,7 +44,7 @@ def test_retrieval_engine_lazy_loading(mock_retrieval_dependencies):
 
 def test_retrieval_engine_fetch_and_rank(mock_retrieval_dependencies):
     """Verify RetrievalEngine fetches user interest profile and ranks them using RankerService."""
-    mock_qdrant, mock_retriever, mock_db = mock_retrieval_dependencies
+    mock_qdrant, mock_retriever = mock_retrieval_dependencies
     
     # 1. Setup mock user profile with interests
     mock_user_point = MagicMock()
@@ -103,10 +98,6 @@ def test_retrieval_engine_fetch_and_rank(mock_retrieval_dependencies):
     engine = RetrievalEngine(qdrant_url="http://localhost:6333")
     engine._ranker = mock_ranker
     
-    # Mock postgres connection
-    mock_conn = MagicMock()
-    mock_db.connect.return_value = mock_conn
-    
     # Call fetch onboarding batches
     batches = engine.fetch_onboarding_batches("user_456")
     
@@ -136,3 +127,27 @@ def test_retrieval_engine_fetch_and_rank(mock_retrieval_dependencies):
     assert batch_1[0]["final_score"] == pytest.approx(10.5)
     assert batch_1[1]["final_score"] == pytest.approx(5.2)
     assert batch_1[2]["final_score"] == pytest.approx(1.1)
+
+
+def test_cold_start_uses_qdrant_profile_without_database_url(
+    mock_retrieval_dependencies,
+    monkeypatch,
+):
+    mock_qdrant, mock_retriever = mock_retrieval_dependencies
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+
+    user_point = MagicMock()
+    user_point.vector = [0.1] * 384
+    user_point.payload = {"skills": ["Python"], "tech_stack": ["FastAPI"]}
+    mock_qdrant.retrieve.return_value = [user_point]
+    mock_retriever.retrieve_candidates.return_value = []
+
+    engine = RetrievalEngine(qdrant_url="http://localhost:6333")
+    batches = engine.fetch_onboarding_batches("cold-user", is_cold_start=True)
+
+    assert batches == {"batch_1": [], "batch_2": [], "batch_3": []}
+    mock_retriever.retrieve_candidates.assert_called_once_with(
+        user_embedding=[0.1] * 384,
+        user_interests=["Python", "FastAPI"],
+    )
+    assert not hasattr(engine, "_db")

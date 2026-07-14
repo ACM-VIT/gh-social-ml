@@ -390,22 +390,7 @@ if __name__ == "__main__":
                 print(f"\n👤 USER: {user['full_name']} (@{uid})")
                 print(f"   Bio: {user['bio']}")
                 print(f"   Interests: {user['interests']}")
-                print("   Fetching and ranking recommendation batches (bypassing cache)...")
-
-                # Force invalidate cache for demo freshness
-                if engine.db and engine.db.enabled:
-                    conn = None
-                    try:
-                        conn = engine.db.connect()
-                        cursor = conn.cursor()
-                        cursor.execute("DELETE FROM user_recommendation_batches WHERE user_id = %s;", (uid,))
-                        conn.commit()
-                    except Exception:
-                        if conn:
-                            conn.rollback()
-                    finally:
-                        if conn:
-                            conn.close()
+                print("   Fetching and ranking fresh recommendation batches...")
 
                 batches = engine.fetch_onboarding_batches(uid)
 

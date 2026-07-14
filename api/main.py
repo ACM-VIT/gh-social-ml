@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 
 from feedback.producer import FeedbackProducer
 from feedback.consumer import FeedbackConsumer
+from feedback.event_handlers import normalize_feedback_action
 from retrieval_engine import RetrievalEngine
 from scripts.user_onboarding import UserOnboardingPipeline
 from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
@@ -66,11 +67,13 @@ repo_embedding_pipeline: RepositoryEmbeddingPipeline | None = None
 
 
 class FeedbackRequest(BaseModel):
-    user_id: str = Field(..., description="Unique ID of the user performing the action")
-    repo_id: str = Field(..., description="Full name or UUID of the repository")
+    user_id: str = Field(..., min_length=1, max_length=255, description="Application user UUID")
+    repo_id: str = Field(..., min_length=1, max_length=255, description="Repository UUID")
     action: str = Field(
         ...,
-        description="Interaction action type: click, like, save, skip, or dwell",
+        min_length=1,
+        max_length=32,
+        description="Canonical backend feedback action",
     )
     dwell_seconds: float | None = Field(
         default=None,
@@ -82,32 +85,36 @@ class FeedbackRequest(BaseModel):
     )
 
 
+class FeedbackBatchRequest(BaseModel):
+    events: list[FeedbackRequest] = Field(..., min_length=1, max_length=100)
+
+
 class RecommendationRequest(BaseModel):
-    user_id: str = Field(..., min_length=1, description="Application user UUID")
+    user_id: str = Field(..., min_length=1, max_length=255, description="Application user UUID")
     is_cold_start: bool = Field(default=False, description="True if user has zero interactions")
 
 
 class OnboardingRequest(BaseModel):
-    user_id: str = Field(..., min_length=1, description="Application user UUID")
-    github_username: str | None = Field(default=None, description="Linked GitHub username")
-    username: str | None = None
-    full_name: str | None = None
-    bio: str | None = None
-    interests: list[str] = Field(default_factory=list)
-    skills: list[str] = Field(default_factory=list)
-    tech_stack: list[str] = Field(default_factory=list)
-    avatar_url: str | None = None
+    user_id: str = Field(..., min_length=1, max_length=255, description="Application user UUID")
+    github_username: str | None = Field(default=None, max_length=255, description="Linked GitHub username")
+    username: str | None = Field(default=None, max_length=255)
+    full_name: str | None = Field(default=None, max_length=255)
+    bio: str | None = Field(default=None, max_length=2000)
+    interests: list[str] = Field(default_factory=list, max_length=100)
+    skills: list[str] = Field(default_factory=list, max_length=100)
+    tech_stack: list[str] = Field(default_factory=list, max_length=100)
+    avatar_url: str | None = Field(default=None, max_length=2048)
 
 
 class EmbedRepoRequest(BaseModel):
-    repo_id: str = Field(..., min_length=1, description="Backend repository UUID")
-    github_repo: str = Field(..., min_length=1, description="GitHub owner/name")
-    github_repo_url: str | None = None
-    description: str | None = None
-    primary_language: str | None = None
-    languages: list[str] = Field(default_factory=list)
-    topics: list[str] = Field(default_factory=list)
-    readme_summary: str | None = None
+    repo_id: str = Field(..., min_length=1, max_length=255, description="Backend repository UUID")
+    github_repo: str = Field(..., min_length=1, max_length=255, description="GitHub owner/name")
+    github_repo_url: str | None = Field(default=None, max_length=2048)
+    description: str | None = Field(default=None, max_length=5000)
+    primary_language: str | None = Field(default=None, max_length=255)
+    languages: list[str] = Field(default_factory=list, max_length=100)
+    topics: list[str] = Field(default_factory=list, max_length=100)
+    readme_summary: str | None = Field(default=None, max_length=50000)
     star_count: int = Field(default=0, ge=0)
     fork_count: int = Field(default=0, ge=0)
     open_issues_count: int = Field(default=0, ge=0)
@@ -147,20 +154,23 @@ app = FastAPI(
 )
 
 
-@app.post("/api/v1/feedback", status_code=status.HTTP_202_ACCEPTED)
+@app.post(
+    "/api/v1/feedback",
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_internal_secret)],
+)
 async def submit_feedback(request: FeedbackRequest):
     """Submit a user interaction event.
 
     Pushes the event to the processing queue and returns 202 Accepted.
-    Supported actions: ``click``, ``like``, ``save``, ``skip``, ``dwell``.
+    Canonical backend actions and the legacy ``click``/``skip`` aliases are accepted.
     When ``action`` is ``dwell``, ``dwell_seconds`` must be provided and > 0.
     """
-    action = request.action.lower()
-    valid_actions = {"click", "like", "save", "skip", "dwell"}
-    if action not in valid_actions:
+    action = normalize_feedback_action(request.action)
+    if action is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid action: '{request.action}'. Supported actions are: {sorted(valid_actions)}",
+            detail=f"Invalid action: '{request.action}'.",
         )
 
     # Validate dwell-specific contract
@@ -206,8 +216,55 @@ async def submit_feedback(request: FeedbackRequest):
         logger.error("Failed to process feedback submission: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Internal API error: {str(exc)}",
+            detail="Internal API error while queuing feedback.",
         )
+
+
+@app.post(
+    "/api/v1/feedback/batch",
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_internal_secret)],
+)
+async def submit_feedback_batch(request: FeedbackBatchRequest):
+    """Enqueue one backend activity batch with a single Redis round trip."""
+    events: list[dict] = []
+    for event in request.events:
+        action = normalize_feedback_action(event.action)
+        if action is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid action: '{event.action}'.",
+            )
+        if action == "dwell" and event.dwell_seconds is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="'dwell_seconds' is required when action is 'dwell'.",
+            )
+        payload = {
+            "user_id": event.user_id,
+            "repo_id": event.repo_id,
+            "action": action,
+        }
+        if event.dwell_seconds is not None:
+            payload["dwell_seconds"] = event.dwell_seconds
+        events.append(payload)
+
+    try:
+        success = await producer.submit_feedback_batch(events)
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to enqueue feedback events.",
+            )
+        return {"status": "accepted", "accepted_count": len(events)}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Failed to process feedback batch: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal API error while queuing feedback.",
+        ) from exc
 
 
 @app.post("/api/v1/recommendations/generate", dependencies=[Depends(require_internal_secret)])
@@ -239,7 +296,7 @@ async def generate_recommendations(request: RecommendationRequest):
         logger.exception("Recommendation generation failed for user '%s'", request.user_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to generate recommendations: {str(exc)}",
+            detail="Failed to generate recommendations.",
         )
 
 
@@ -281,7 +338,7 @@ async def onboard_user(request: OnboardingRequest):
         logger.exception("User onboarding failed for '%s'", user_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to onboard user: {str(exc)}",
+            detail="Failed to onboard user.",
         )
 
 
@@ -330,14 +387,26 @@ async def embed_repo(request: EmbedRepoRequest):
         logger.exception("Repository embedding failed for '%s'", request.github_repo)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to embed repository: {str(exc)}",
+            detail="Failed to embed repository.",
         )
 
 
 @app.get("/api/v1/health")
 async def health_check():
-    """Basic service health check."""
+    """Readiness check for durable online feedback processing."""
+    feedback_ready = bool(
+        producer
+        and producer.redis_client
+        and consumer
+        and consumer.redis_client
+        and consumer.running
+    )
+    if not feedback_ready:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Durable feedback processing is unavailable.",
+        )
     return {
         "status": "healthy",
-        "consumer_running": consumer.running if consumer else False,
+        "consumer_running": True,
     }

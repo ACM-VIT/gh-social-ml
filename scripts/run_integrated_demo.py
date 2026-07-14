@@ -17,7 +17,6 @@ Usage::
     python3 scripts/run_integrated_demo.py --onboard-first
 
     # Force re-generate batches (bypass 24-hour cache)
-    python3 scripts/run_integrated_demo.py --no-cache
 """
 
 from __future__ import annotations
@@ -63,37 +62,6 @@ def _onboard_mock_users() -> None:
             logger.warning("  ⚠️   Failed to onboard: %s", uid)
 
 
-def _invalidate_cache(user_id: str, engine) -> None:
-    """Delete any existing cached batches for user_id from Postgres."""
-    db = engine.db
-    if db is None or not db.enabled:
-        return
-    conn = None
-    try:
-        conn = db.connect()
-        cursor = conn.cursor()
-        engine._ensure_recommendations_table(conn)
-        cursor.execute(
-            "DELETE FROM user_recommendation_batches WHERE user_id = %s;",
-            (user_id,),
-        )
-        conn.commit()
-        logger.info("Cache invalidated for '%s'.", user_id)
-    except Exception as exc:
-        logger.warning("Cache invalidation failed for '%s': %s", user_id, exc)
-        if conn:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-    finally:
-        if conn:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-
 def _print_batch(
     batch_name: str,
     batch: list[dict],
@@ -124,14 +92,11 @@ def _print_batch(
             print(f"  {i:<3} {source:<10} {repo_name:<42} {lang}")
 
 
-def _run_for_user(engine, user_id: str, no_cache: bool) -> None:
+def _run_for_user(engine, user_id: str) -> None:
     """Run the integrated pipeline for a single user and print the results."""
     print(f"\n{'=' * 80}")
     print(f"  USER: {user_id}")
     print(f"{'=' * 80}")
-
-    if no_cache:
-        _invalidate_cache(user_id, engine)
 
     try:
         batches = engine.fetch_onboarding_batches(user_id)
@@ -184,11 +149,6 @@ def parse_args() -> argparse.Namespace:
         help="Onboard mock users into Qdrant before running the pipeline.",
     )
     p.add_argument(
-        "--no-cache",
-        action="store_true",
-        help="Bypass the 24-hour recommendation cache and regenerate batches.",
-    )
-    p.add_argument(
         "--log-level",
         type=str,
         default="INFO",
@@ -211,7 +171,7 @@ def main() -> None:
     engine = RetrievalEngine()
 
     if args.user_id:
-        _run_for_user(engine, args.user_id, no_cache=args.no_cache)
+        _run_for_user(engine, args.user_id)
     else:
         users = engine.list_onboarded_users()
         if not users:
@@ -221,7 +181,7 @@ def main() -> None:
 
         logger.info("Found %d onboarded user(s). Running integrated pipeline...", len(users))
         for user_info in users:
-            _run_for_user(engine, user_info["user_id"], no_cache=args.no_cache)
+            _run_for_user(engine, user_info["user_id"])
 
     print(f"\n{'=' * 80}")
     print("Done.")

@@ -28,11 +28,10 @@ EMBEDDING_DIM          = 384
 # ── Timeout & Safety ────────────────────────────────────────────────────────
 
 QDRANT_TIMEOUT_SECONDS = 10     # Max wait for a single Qdrant query
-DB_QUERY_TIMEOUT_SECONDS = 10   # Max wait for a single PostgreSQL query
 
 # ── Fallback Repositories ───────────────────────────────────────────────────
-# Hardcoded stable repo full_names returned when both Qdrant and PostgreSQL
-# are unreachable (catastrophic failure). These must exist in the corpus.
+# Hardcoded stable repo full_names returned when Qdrant is unreachable. These
+# should exist in the backend corpus so it can enrich the fallback response.
 
 FALLBACK_REPOS = [
     "facebook/react",
@@ -58,8 +57,5 @@ FALLBACK_REPOS = [
 ]
 
 # ── Cold Start Configuration ────────────────────────────────────────────────
-COLD_START_SKILL_MATCH_LIMIT = 60   # Max repos from skill-matched Postgres query
-COLD_START_TRENDING_LIMIT    = 30   # Max supplemental trending repos for diversity
-COLD_START_MIN_STARS         = 0    # Quality floor for cold-start repos (lowered for local dev)
 COLD_START_SKILL_WEIGHT      = 0.6  # Weight for skill/language match in scoring
 COLD_START_STARS_WEIGHT      = 0.4  # Weight for normalised star count in scoring

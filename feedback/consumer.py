@@ -2,6 +2,7 @@ import os
 import logging
 import asyncio
 import socket
+import time
 from typing import Dict, Any
 
 from .producer import get_in_memory_queue
@@ -15,9 +16,16 @@ class FeedbackConsumer:
         self,
         handler: FeedbackHandler | None = None,
         redis_url: str | None = None,
+        *,
+        allow_in_memory: bool | None = None,
     ) -> None:
         self.handler = handler or FeedbackHandler()
         self.redis_url = redis_url or os.getenv("REDIS_URL")
+        self.allow_in_memory = (
+            allow_in_memory
+            if allow_in_memory is not None
+            else os.getenv("ALLOW_IN_MEMORY_FEEDBACK", "false").lower() == "true"
+        )
         self.redis_client = None
         self.running = False
         self.task: asyncio.Task | None = None
@@ -39,9 +47,12 @@ class FeedbackConsumer:
         if self.redis_client:
             # Run Redis consumer loop
             self.task = asyncio.create_task(self._redis_consume_loop())
-        else:
+        elif self.allow_in_memory:
             # Run in-memory consumer loop
             self.task = asyncio.create_task(self._in_memory_consume_loop())
+        else:
+            self.running = False
+            raise RuntimeError("REDIS_URL is required for durable feedback processing")
 
     def stop(self) -> None:
         """Stop the consumer loop."""
@@ -93,6 +104,8 @@ class FeedbackConsumer:
         logger.info("Feedback Consumer running in Redis Streams mode.")
         stream_name = "feedback_stream"
         group_name = "feedback_group"
+        claim_idle_ms = max(10_000, int(os.getenv("FEEDBACK_CLAIM_IDLE_MS", "60000")))
+        last_claim_at = 0.0
         # Dynamic consumer name to allow safe horizontal scaling
         consumer_name = f"worker_{socket.gethostname()}_{os.getpid()}"
 
@@ -102,25 +115,56 @@ class FeedbackConsumer:
         except Exception as exc:
             # Group might already exist (BUSYGROUP)
             if "BUSYGROUP" not in str(exc):
-                logger.error("Failed to create Redis Stream group: %s. Falling back to In-Memory.", exc)
-                self.task = asyncio.create_task(self._in_memory_consume_loop())
+                logger.error("Failed to create Redis Stream group: %s", exc)
+                if self.allow_in_memory:
+                    self.task = asyncio.create_task(self._in_memory_consume_loop())
+                else:
+                    self.running = False
                 return
 
+        loop = asyncio.get_running_loop()
         while self.running:
             try:
+                claimed_messages = []
+                now = time.monotonic()
+                if now - last_claim_at >= 60.0:
+                    last_claim_at = now
+                    try:
+                        claim_response = await loop.run_in_executor(
+                            None,
+                            lambda: self.redis_client.xautoclaim(
+                                stream_name,
+                                group_name,
+                                consumer_name,
+                                claim_idle_ms,
+                                start_id="0-0",
+                                count=32,
+                            ),
+                        )
+                        if (
+                            isinstance(claim_response, (list, tuple))
+                            and len(claim_response) >= 2
+                            and isinstance(claim_response[1], list)
+                        ):
+                            claimed_messages = claim_response[1]
+                    except Exception as claim_exc:
+                        logger.warning("Failed to reclaim stale feedback messages: %s", claim_exc)
+
                 # Read from group
                 # Since redis-py blocking commands block the event loop, we run in executor
-                loop = asyncio.get_running_loop()
                 response = await loop.run_in_executor(
                     None,
                     lambda: self.redis_client.xreadgroup(
                         group_name,
                         consumer_name,
                         {stream_name: ">"},
-                        count=1,
+                        count=32,
                         block=1000,
                     ),
                 )
+
+                if claimed_messages:
+                    response = [(stream_name, claimed_messages), *response]
 
                 if not response:
                     await asyncio.sleep(0.1)
@@ -165,14 +209,16 @@ class FeedbackConsumer:
                             else:
                                 processed_success = False
                                 try:
-                                    # Execute vector updates and metric increments
-                                    await loop.run_in_executor(
+                                    # Execute the ML-owned user-vector update.
+                                    handler_succeeded = await loop.run_in_executor(
                                         None,
                                         lambda: self.handler.handle_feedback(
                                             user_id, repo_id, action,
                                             dwell_seconds=dwell_seconds,
                                         ),
                                     )
+                                    if not handler_succeeded:
+                                        raise RuntimeError("Feedback handler rejected the event")
                                     processed_success = True
                                     
                                     # Mark as processed in Redis (expires in 24 hours)

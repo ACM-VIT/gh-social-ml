@@ -1,13 +1,12 @@
 import logging
-import uuid
-import numpy as np
 import math
-from typing import Any, Dict, List, Optional
+import uuid
+from typing import List, Optional
 
+import numpy as np
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct
 
-from database.connector import PostgreSQLConnector
 from config import (
     QDRANT_URL,
     QDRANT_API_KEY,
@@ -17,27 +16,36 @@ from config import (
     MAX_DWELL_SECONDS,
     DWELL_BASE_ALPHA,
 )
+from embedding.qdrant_store import repository_point_id
 from scripts.user_onboarding import USER_PROFILES_COLLECTION, TARGET_VECTOR_NAME
 
 logger = logging.getLogger("pipeline.feedback")
 
-# Action-weights for vector adjustment (learning rate \alpha)
+# Canonical action weights for user-vector adjustment. Reversal events apply
+# the inverse of the original action because the Qdrant profile is an online
+# aggregate rather than a per-event feature ledger.
 ACTION_WEIGHTS = {
-    "click": 0.05,
+    "readme_open": 0.06,
+    "github_open": 0.10,
     "like": 0.15,
     "save": 0.20,
-    "skip": -0.10,
+    "share": 0.12,
+    "dislike": -0.15,
+    "unlike": -0.15,
+    "unsave": -0.20,
+    "undislike": 0.15,
     "dwell": None,   # dynamic: computed by _dwell_alpha(dwell_seconds)
 }
+NOOP_ACTIONS = {"impression"}
+ACTION_ALIASES = {"click": "readme_open", "skip": "impression"}
+SUPPORTED_ACTIONS = frozenset({*ACTION_WEIGHTS, *NOOP_ACTIONS})
 
-# PostgreSQL column mapping for repository engagement stats.
-# "dwell" maps to None — it only updates the Qdrant embedding, not a Postgres counter.
-METRIC_COLUMNS = {
-    "click": "views_count",
-    "like": "likes_count",
-    "save": "saves_count",
-    "dwell": None,   # no Postgres column — embedding-only signal
-}
+
+def normalize_feedback_action(action: str) -> str | None:
+    """Normalize legacy producers and validate the canonical event vocabulary."""
+    normalized = action.strip().lower()
+    normalized = ACTION_ALIASES.get(normalized, normalized)
+    return normalized if normalized in SUPPORTED_ACTIONS else None
 
 
 def _dwell_alpha(dwell_seconds: float) -> Optional[float]:
@@ -79,11 +87,9 @@ def shift_vector(user_vec: List[float], repo_vec: List[float], alpha: float) -> 
 class FeedbackHandler:
     def __init__(
         self,
-        db_connector: PostgreSQLConnector | None = None,
         qdrant_url: str | None = None,
         qdrant_api_key: str | None = None,
     ) -> None:
-        self.db = db_connector or PostgreSQLConnector()
         self.qdrant_url = qdrant_url or QDRANT_URL
         self.qdrant_api_key = qdrant_api_key or QDRANT_API_KEY
 
@@ -110,20 +116,29 @@ class FeedbackHandler:
         *,
         dwell_seconds: Optional[float] = None,
     ) -> bool:
-        """Process a single feedback event: update Postgres counters and shift Qdrant embedding.
+        """Process a feedback event as an ML-owned user-vector update.
+
+        Transactional interaction state, counters, and feed-cache invalidation are
+        owned by the backend. This handler intentionally has no app-database
+        dependency so online feedback processing can run without ``DATABASE_URL``.
 
         Parameters
         ----------
         user_id       : Unique user identifier.
         repo_id       : Repository full_name or UUID.
-        action        : One of click | like | save | skip | dwell.
+        action        : Canonical backend feedback action or a supported legacy alias.
         dwell_seconds : Required when action == 'dwell'. Observed time the user
                         spent on the repository card, in seconds.
         """
-        action = action.lower()
-        if action not in ACTION_WEIGHTS:
+        normalized_action = normalize_feedback_action(action)
+        if normalized_action is None:
             logger.error("Unknown feedback action: %s", action)
             return False
+        action = normalized_action
+
+        if action in NOOP_ACTIONS:
+            logger.debug("Accepted neutral feedback action '%s' as a no-op.", action)
+            return True
 
         # Resolve the embedding learning rate (alpha) for this event.
         if action == "dwell":
@@ -135,8 +150,8 @@ class FeedbackHandler:
                 return False
             resolved_alpha = _dwell_alpha(float(dwell_seconds))
             if resolved_alpha is None:
-                # The below early return is for discarding sub-threshold dwells cleanly
-                # without touching Postgres or Qdrant — accidental scroll, not real interest.
+                # Discard sub-threshold dwells cleanly. They are accidental
+                # scrolls rather than useful interest signals.
                 logger.debug(
                     "Dwell %.1fs below MIN_DWELL_SECONDS=%.1fs for user '%s'. Ignored.",
                     dwell_seconds, MIN_DWELL_SECONDS, user_id,
@@ -151,90 +166,13 @@ class FeedbackHandler:
             resolved_alpha if resolved_alpha is not None else 0.0,
         )
 
-        # 1. Update PostgreSQL engagement counts (dwell has no column — no-op)
-        db_success = self.update_postgres_metrics(repo_id, action)
-        if not db_success:
-            logger.warning("Failed to update engagement metrics in Postgres for '%s'", repo_id)
-
-        # 2. Update Qdrant user embedding vector using the resolved alpha
+        # Update the ML-owned Qdrant profile vector. App database state and
+        # Redis feed-cache invalidation remain backend responsibilities.
         qdrant_success = self.update_user_embedding(user_id, repo_id, resolved_alpha)
         if not qdrant_success:
             logger.warning("Failed to adjust Qdrant profile embedding for user '%s'", user_id)
 
-        # 3. Invalidate the cached feed batches for this user in PostgreSQL
-        cache_success = self.invalidate_user_feed_cache(user_id)
-        if not cache_success:
-            logger.warning("Failed to invalidate feed cache for user '%s'", user_id)
-
-        return db_success and qdrant_success and cache_success
-
-    def update_postgres_metrics(self, repo_id: str, action: str) -> bool:
-        """Increment the metric count inside the Repo PostgreSQL table."""
-        column = METRIC_COLUMNS.get(action)
-        if column is None or not self.db.enabled:
-            # 'skip' and 'dwell' have no Postgres counter — treat as success
-            return True
-
-        # Guard against SQL injection via strict whitelist validation (defense-in-depth)
-        if column not in {"views_count", "likes_count", "saves_count"}:
-            logger.error("Forbidden database column update: '%s'", column)
-            return False
-
-        conn = None
-        try:
-            conn = self.db._get_connection()
-            cursor = conn.cursor()
-
-            # Increment count defensively handling NULL values using COALESCE
-            query = f"""
-            UPDATE Repo
-            SET {column} = COALESCE({column}, 0) + 1,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE full_name = %s OR repo_id::text = %s;
-            """
-            cursor.execute(query, (repo_id, repo_id))
-            conn.commit()
-
-            logger.info("Successfully incremented %s count for repo '%s'", column, repo_id)
-            return True
-        except Exception as exc:
-            logger.error("Error updating metrics in Postgres for repo '%s': %s", repo_id, exc)
-            if conn:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-            return False
-
-    def _resolve_repo_full_name(self, repo_id: str) -> str:
-        """Resolve a Postgres UUID back to full_name. If already full_name, return it."""
-        if len(repo_id) != 36 or repo_id.count("-") != 4:
-            return repo_id
-        if not self.db or not self.db.enabled:
-            return repo_id
-        conn = None
-        try:
-            conn = self.db._get_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT full_name FROM repo WHERE repo_id::text = %s", (repo_id,))
-            row = cursor.fetchone()
-            if row:
-                conn.commit()
-                return row[0]
-            cursor.execute("SELECT full_name FROM trending_repositories WHERE repo_id::text = %s", (repo_id,))
-            row = cursor.fetchone()
-            if row:
-                conn.commit()
-                return row[0]
-            conn.commit()
-        except Exception as e:
-            logger.error("Error resolving repo full_name: %s", e)
-            if conn:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-        return repo_id
+        return qdrant_success
 
     def update_user_embedding(self, user_id: str, repo_id: str, alpha: float) -> bool:
         """Shift the user's Qdrant embedding towards (or away from) a repository vector.
@@ -250,9 +188,11 @@ class FeedbackHandler:
             logger.warning("Qdrant client not configured; skipping vector shift.")
             return False
 
-        actual_repo_id = self._resolve_repo_full_name(repo_id)
         user_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"user:{user_id}"))
-        repo_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"github:{actual_repo_id}"))
+        # RepositoryEmbeddingPipeline uses the incoming backend repo ID as its
+        # deterministic point key. This works for both backend UUIDs and older
+        # owner/name corpus IDs without a Postgres ID-resolution query.
+        repo_uuid = repository_point_id(repo_id)
 
         try:
             # 1. Fetch user vector and payload
@@ -328,30 +268,4 @@ class FeedbackHandler:
             return True
         except Exception as exc:
             logger.error("Failed to update user vector in Qdrant: %s", exc)
-            return False
-
-    def invalidate_user_feed_cache(self, user_id: str) -> bool:
-        """Invalidate the cached recommendation batches for this user in PostgreSQL."""
-        if not self.db.enabled:
-            return True
-
-        conn = None
-        try:
-            conn = self.db._get_connection()
-            cursor = conn.cursor()
-
-            # Delete cache row for user
-            query = "DELETE FROM user_recommendation_batches WHERE user_id = %s;"
-            cursor.execute(query, (user_id,))
-            conn.commit()
-
-            logger.info("Invalidated recommendation cache for user '%s'", user_id)
-            return True
-        except Exception as exc:
-            logger.error("Failed to delete cache in PostgreSQL for user '%s': %s", user_id, exc)
-            if conn:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
             return False
