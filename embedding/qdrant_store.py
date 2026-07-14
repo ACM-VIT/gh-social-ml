@@ -20,6 +20,11 @@ from .repository_embedding import RepositoryEmbeddingResult
 logger = logging.getLogger(__name__)
 
 
+def repository_point_id(repo_id: str) -> str:
+    """Return the stable Qdrant point ID shared by indexing and feedback."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"github:{repo_id}"))
+
+
 class QdrantRepositoryStore:
     """Creates and writes repository vectors to Qdrant."""
 
@@ -32,6 +37,7 @@ class QdrantRepositoryStore:
         vector_name: str = QDRANT_VECTOR_NAME,
         vector_size: int = REPOSITORY_EMBEDDING_DIM,
         distance: str = QDRANT_DISTANCE,
+        timeout: float = 10.0,
     ) -> None:
         try:
             from qdrant_client import QdrantClient
@@ -42,7 +48,7 @@ class QdrantRepositoryStore:
                 "Install dependencies from requirements.txt."
             ) from exc
 
-        self.client = QdrantClient(url=url, api_key=api_key)
+        self.client = QdrantClient(url=url, api_key=api_key, timeout=timeout)
         self.models = models
         self.collection_name = collection_name
         self.vector_name = vector_name
@@ -85,7 +91,7 @@ class QdrantRepositoryStore:
             # updated instead of inserted as a duplicate vector.
             points.append(
                 self.models.PointStruct(
-                    id=self._point_id(result.repo_id),
+                    id=repository_point_id(result.repo_id),
                     vector={self.vector_name: result.final_embedding},
                     payload=result.payload,
                 )
@@ -165,6 +171,37 @@ class QdrantRepositoryStore:
                 break
         return points
 
+    def list_points_ordered(
+        self,
+        *,
+        order_by: str,
+        limit: int = 100,
+        descending: bool = True,
+        with_vectors: bool = True,
+    ) -> list[dict]:
+        """Load a bounded set of points ordered by an indexed payload field."""
+        direction = self.models.Direction.DESC if descending else self.models.Direction.ASC
+        records, _ = self.client.scroll(
+            collection_name=self.collection_name,
+            limit=limit,
+            order_by=self.models.OrderBy(key=order_by, direction=direction),
+            with_payload=True,
+            with_vectors=[self.vector_name] if with_vectors else False,
+        )
+        points: list[dict] = []
+        for record in records:
+            payload = record.payload or {}
+            points.append(
+                {
+                    "id": str(record.id),
+                    "repo_id": payload.get("repo_id"),
+                    "full_name": payload.get("full_name"),
+                    "payload": payload,
+                    "vector": self._extract_vector(record.vector) if with_vectors else None,
+                }
+            )
+        return points
+
     def _extract_vector(self, vector_data) -> list[float] | None:
         if vector_data is None:
             return None
@@ -209,6 +246,8 @@ class QdrantRepositoryStore:
         schema = self.models.PayloadSchemaType.KEYWORD
         if field_name in {"star_count"}:
             schema = self.models.PayloadSchemaType.INTEGER
+        if field_name in {"trend_velocity", "activity_score", "doc_quality", "code_health"}:
+            schema = self.models.PayloadSchemaType.FLOAT
         if field_name in {"updated_at", "pushed_at"}:
             schema = self.models.PayloadSchemaType.DATETIME
         try:
@@ -222,7 +261,8 @@ class QdrantRepositoryStore:
 
     @staticmethod
     def _point_id(repo_id: str) -> str:
-        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"github:{repo_id}"))
+        """Backward-compatible wrapper for callers using the previous helper."""
+        return repository_point_id(repo_id)
 
     def _distance(self):
         try:

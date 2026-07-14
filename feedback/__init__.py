@@ -2,7 +2,7 @@
 
 Public API
 ----------
-FeedbackHandler   -- processes a single event (Postgres + Qdrant update)
+FeedbackHandler   -- processes a single event as a Qdrant profile update
 FeedbackProducer  -- enqueues events (Redis stream or in-memory fallback)
 FeedbackConsumer  -- async worker that drains the queue and calls FeedbackHandler
 _dwell_alpha      -- maps raw dwell seconds to an embedding learning rate

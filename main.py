@@ -40,8 +40,6 @@ def _setup_logging(level: str = "INFO") -> None:
 
 logger = logging.getLogger("pipeline.acquisition")
 
-CORPUS_TARGET_COUNT = 3500
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ACQUISITION
@@ -269,7 +267,7 @@ if __name__ == "__main__":
     else:
         logger.info("Database connector is not enabled. Ingestion/hydration will be disabled.")
 
-    target_count = CORPUS_TARGET_COUNT
+    target_count = 3500
     kept = []
 
     # ── Step 2: Fetch & Index if under target ─────────────────────────────────
@@ -367,7 +365,7 @@ if __name__ == "__main__":
 
     # ── Step 3: Integrated Candidate Retrieval + Ranking Demo ──────────────────
     if current_count >= target_count:
-        logger.info("Corpus target of %d reached. Executing Integrated Retrieval + Ranking Demo...", target_count)
+        logger.info("Corpus target of 3500 reached. Executing Integrated Retrieval + Ranking Demo...")
         try:
             from scripts.mock_users import MOCK_USERS
             from scripts.user_onboarding import onboard_user
@@ -392,22 +390,7 @@ if __name__ == "__main__":
                 print(f"\n👤 USER: {user['full_name']} (@{uid})")
                 print(f"   Bio: {user['bio']}")
                 print(f"   Interests: {user['interests']}")
-                print("   Fetching and ranking recommendation batches (bypassing cache)...")
-
-                # Force invalidate cache for demo freshness
-                if engine.db and engine.db.enabled:
-                    conn = None
-                    try:
-                        conn = engine.db.connect()
-                        cursor = conn.cursor()
-                        cursor.execute("DELETE FROM user_recommendation_batches WHERE user_id = %s;", (uid,))
-                        conn.commit()
-                    except Exception:
-                        if conn:
-                            conn.rollback()
-                    finally:
-                        if conn:
-                            conn.close()
+                print("   Fetching and ranking fresh recommendation batches...")
 
                 batches = engine.fetch_onboarding_batches(uid)
 

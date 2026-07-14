@@ -1,6 +1,5 @@
 import logging
 import os
-from uuid import UUID
 
 # Load .env FIRST — before any imports that call os.getenv() at module level
 # (e.g. scripts/user_onboarding.py reads QDRANT_URL on import)
@@ -22,8 +21,7 @@ from pydantic import BaseModel, Field
 
 from feedback.producer import FeedbackProducer
 from feedback.consumer import FeedbackConsumer
-from feedback.interactions import INTERACTIONS, get_interaction
-from feedback.storage import FeedbackStore
+from feedback.event_handlers import normalize_feedback_action
 from retrieval_engine import RetrievalEngine
 from scripts.user_onboarding import UserOnboardingPipeline
 from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
@@ -66,15 +64,16 @@ consumer: FeedbackConsumer | None = None
 retrieval_engine: RetrievalEngine | None = None
 onboarding_pipeline: UserOnboardingPipeline | None = None
 repo_embedding_pipeline: RepositoryEmbeddingPipeline | None = None
-feedback_store: FeedbackStore | None = None
 
 
 class FeedbackRequest(BaseModel):
-    user_id: UUID = Field(..., description="Application user UUID performing the action")
-    repo_id: str = Field(..., description="Full name or UUID of the repository")
+    user_id: str = Field(..., min_length=1, max_length=255, description="Application user UUID")
+    repo_id: str = Field(..., min_length=1, max_length=255, description="Repository UUID")
     action: str = Field(
         ...,
-        description="Versioned feedback action type",
+        min_length=1,
+        max_length=32,
+        description="Canonical backend feedback action",
     )
     dwell_seconds: float | None = Field(
         default=None,
@@ -86,32 +85,36 @@ class FeedbackRequest(BaseModel):
     )
 
 
+class FeedbackBatchRequest(BaseModel):
+    events: list[FeedbackRequest] = Field(..., min_length=1, max_length=100)
+
+
 class RecommendationRequest(BaseModel):
-    user_id: str = Field(..., min_length=1, description="Application user UUID")
+    user_id: str = Field(..., min_length=1, max_length=255, description="Application user UUID")
     is_cold_start: bool = Field(default=False, description="True if user has zero interactions")
 
 
 class OnboardingRequest(BaseModel):
-    user_id: str = Field(..., min_length=1, description="Application user UUID")
-    github_username: str | None = Field(default=None, description="Linked GitHub username")
-    username: str | None = None
-    full_name: str | None = None
-    bio: str | None = None
-    interests: list[str] = Field(default_factory=list)
-    skills: list[str] = Field(default_factory=list)
-    tech_stack: list[str] = Field(default_factory=list)
-    avatar_url: str | None = None
+    user_id: str = Field(..., min_length=1, max_length=255, description="Application user UUID")
+    github_username: str | None = Field(default=None, max_length=255, description="Linked GitHub username")
+    username: str | None = Field(default=None, max_length=255)
+    full_name: str | None = Field(default=None, max_length=255)
+    bio: str | None = Field(default=None, max_length=2000)
+    interests: list[str] = Field(default_factory=list, max_length=100)
+    skills: list[str] = Field(default_factory=list, max_length=100)
+    tech_stack: list[str] = Field(default_factory=list, max_length=100)
+    avatar_url: str | None = Field(default=None, max_length=2048)
 
 
 class EmbedRepoRequest(BaseModel):
-    repo_id: str = Field(..., min_length=1, description="Backend repository UUID")
-    github_repo: str = Field(..., min_length=1, description="GitHub owner/name")
-    github_repo_url: str | None = None
-    description: str | None = None
-    primary_language: str | None = None
-    languages: list[str] = Field(default_factory=list)
-    topics: list[str] = Field(default_factory=list)
-    readme_summary: str | None = None
+    repo_id: str = Field(..., min_length=1, max_length=255, description="Backend repository UUID")
+    github_repo: str = Field(..., min_length=1, max_length=255, description="GitHub owner/name")
+    github_repo_url: str | None = Field(default=None, max_length=2048)
+    description: str | None = Field(default=None, max_length=5000)
+    primary_language: str | None = Field(default=None, max_length=255)
+    languages: list[str] = Field(default_factory=list, max_length=100)
+    topics: list[str] = Field(default_factory=list, max_length=100)
+    readme_summary: str | None = Field(default=None, max_length=50000)
     star_count: int = Field(default=0, ge=0)
     fork_count: int = Field(default=0, ge=0)
     open_issues_count: int = Field(default=0, ge=0)
@@ -122,15 +125,13 @@ class EmbedRepoRequest(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle manager to initialize components and background worker tasks."""
-    global producer, consumer, retrieval_engine, onboarding_pipeline, repo_embedding_pipeline, feedback_store
+    global producer, consumer, retrieval_engine, onboarding_pipeline, repo_embedding_pipeline
     logger.info("Initializing API components...")
     producer = FeedbackProducer()
     consumer = FeedbackConsumer()
     retrieval_engine = RetrievalEngine()
     onboarding_pipeline = UserOnboardingPipeline()
     repo_embedding_pipeline = RepositoryEmbeddingPipeline()
-    feedback_store = FeedbackStore()
-    feedback_store.init_schema()
     
     # Start background event consume worker loop
     await consumer.start()
@@ -153,20 +154,23 @@ app = FastAPI(
 )
 
 
-@app.post("/api/v1/feedback", status_code=status.HTTP_202_ACCEPTED)
+@app.post(
+    "/api/v1/feedback",
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_internal_secret)],
+)
 async def submit_feedback(request: FeedbackRequest):
     """Submit a user interaction event.
 
     Pushes the event to the processing queue and returns 202 Accepted.
-    Supported actions are the versioned feedback contract actions plus ``dwell``.
+    Canonical backend actions and the legacy ``click``/``skip`` aliases are accepted.
     When ``action`` is ``dwell``, ``dwell_seconds`` must be provided and > 0.
     """
-    action = request.action.lower()
-    valid_actions = set(INTERACTIONS) | {"dwell"}
-    if action not in valid_actions:
+    action = normalize_feedback_action(request.action)
+    if action is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid action: '{request.action}'. Supported actions are: {sorted(valid_actions)}",
+            detail=f"Invalid action: '{request.action}'.",
         )
 
     # Validate dwell-specific contract
@@ -179,7 +183,7 @@ async def submit_feedback(request: FeedbackRequest):
     try:
         # Enqueue the event (dwell_seconds is forwarded as keyword-only arg)
         success = await producer.submit_feedback(
-            user_id=str(request.user_id),
+            user_id=request.user_id,
             repo_id=request.repo_id,
             action=action,
             dwell_seconds=request.dwell_seconds,
@@ -192,12 +196,10 @@ async def submit_feedback(request: FeedbackRequest):
             )
 
         response_data: dict = {
-            "user_id": str(request.user_id),
+            "user_id": request.user_id,
             "repo_id": request.repo_id,
             "action": action,
         }
-        if action != "dwell":
-            response_data["feedback_score"] = get_interaction(action).feedback_score
         if request.dwell_seconds is not None:
             response_data["dwell_seconds"] = request.dwell_seconds
 
@@ -214,40 +216,55 @@ async def submit_feedback(request: FeedbackRequest):
         logger.error("Failed to process feedback submission: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Internal API error: {str(exc)}",
+            detail="Internal API error while queuing feedback.",
         )
 
 
-@app.get("/api/v1/feedback/{user_id}", dependencies=[Depends(require_internal_secret)])
-async def get_user_feedback(user_id: str):
-    """Return the user's persisted effective feedback records."""
-    if feedback_store is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Feedback store is not initialized.",
-        )
-    try:
-        records = await run_in_threadpool(feedback_store.list_for_user, user_id)
-        return {
-            "status": "success",
-            "user_id": user_id,
-            "data": [
-                {
-                    "user_id": record.user_id,
-                    "repo_id": record.repo_id,
-                    "interaction_type": record.interaction_type,
-                    "feedback_score": record.feedback_score,
-                    "timestamp": record.updated_at,
-                }
-                for record in records
-            ],
+@app.post(
+    "/api/v1/feedback/batch",
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_internal_secret)],
+)
+async def submit_feedback_batch(request: FeedbackBatchRequest):
+    """Enqueue one backend activity batch with a single Redis round trip."""
+    events: list[dict] = []
+    for event in request.events:
+        action = normalize_feedback_action(event.action)
+        if action is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid action: '{event.action}'.",
+            )
+        if action == "dwell" and event.dwell_seconds is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="'dwell_seconds' is required when action is 'dwell'.",
+            )
+        payload = {
+            "user_id": event.user_id,
+            "repo_id": event.repo_id,
+            "action": action,
         }
+        if event.dwell_seconds is not None:
+            payload["dwell_seconds"] = event.dwell_seconds
+        events.append(payload)
+
+    try:
+        success = await producer.submit_feedback_batch(events)
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to enqueue feedback events.",
+            )
+        return {"status": "accepted", "accepted_count": len(events)}
+    except HTTPException:
+        raise
     except Exception as exc:
-        logger.exception("Failed to retrieve feedback for '%s'", user_id)
+        logger.error("Failed to process feedback batch: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve feedback: {str(exc)}",
-        )
+            detail="Internal API error while queuing feedback.",
+        ) from exc
 
 
 @app.post("/api/v1/recommendations/generate", dependencies=[Depends(require_internal_secret)])
@@ -279,7 +296,7 @@ async def generate_recommendations(request: RecommendationRequest):
         logger.exception("Recommendation generation failed for user '%s'", request.user_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to generate recommendations: {str(exc)}",
+            detail="Failed to generate recommendations.",
         )
 
 
@@ -321,7 +338,7 @@ async def onboard_user(request: OnboardingRequest):
         logger.exception("User onboarding failed for '%s'", user_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to onboard user: {str(exc)}",
+            detail="Failed to onboard user.",
         )
 
 
@@ -370,14 +387,26 @@ async def embed_repo(request: EmbedRepoRequest):
         logger.exception("Repository embedding failed for '%s'", request.github_repo)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to embed repository: {str(exc)}",
+            detail="Failed to embed repository.",
         )
 
 
 @app.get("/api/v1/health")
 async def health_check():
-    """Basic service health check."""
+    """Readiness check for durable online feedback processing."""
+    feedback_ready = bool(
+        producer
+        and producer.redis_client
+        and consumer
+        and consumer.redis_client
+        and consumer.running
+    )
+    if not feedback_ready:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Durable feedback processing is unavailable.",
+        )
     return {
         "status": "healthy",
-        "consumer_running": consumer.running if consumer else False,
+        "consumer_running": True,
     }

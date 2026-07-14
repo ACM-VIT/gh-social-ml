@@ -2,7 +2,7 @@
 
 This module wires together the complete post-onboarding recommendation pipeline:
 
-  User Profile (Qdrant) → CandidateRetriever (Semantic + Trending) → RankerService (MMoE) → Ranked Batches (Postgres)
+  User Profile (Qdrant) → CandidateRetriever (Semantic + Trending) → RankerService (MMoE) → Ranked Batches
 
 Usage::
 
@@ -29,7 +29,6 @@ except ImportError:
     pass
 
 from qdrant_client import QdrantClient
-from feedback.storage import FeedbackStore, apply_feedback_scores
 
 from config import (  # type: ignore
     QDRANT_API_KEY,
@@ -44,57 +43,27 @@ logger = logging.getLogger("pipeline.retrieval")
 BATCH_SIZE = 15
 NUM_BATCHES = 3
 
-# ── Postgres table for caching recommendation batches ─────────────────────────
-
-_RECOMMENDATIONS_TABLE = "user_recommendation_batches"
-
-_CREATE_TABLE_SQL = f"""
-CREATE TABLE IF NOT EXISTS {_RECOMMENDATIONS_TABLE} (
-    user_id      VARCHAR(255) PRIMARY KEY,
-    batch_data   JSONB NOT NULL,
-    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-"""
-
-_UPSERT_SQL = f"""
-INSERT INTO {_RECOMMENDATIONS_TABLE} (user_id, batch_data)
-VALUES (%s, CAST(%s AS jsonb))
-ON CONFLICT (user_id) DO UPDATE SET
-    batch_data = EXCLUDED.batch_data,
-    updated_at = CURRENT_TIMESTAMP;
-"""
-
-_SELECT_SQL = f"""
-SELECT batch_data FROM {_RECOMMENDATIONS_TABLE}
-WHERE user_id = %s
-  AND updated_at > NOW() - INTERVAL '24 HOURS';
-"""
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  RETRIEVAL ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 
 class RetrievalEngine:
-    """Integrated feed assembler: retrieval + ranking + batch caching.
+    """Integrated feed assembler: retrieval, ranking, and batch generation.
 
     Pipeline
     --------
     1. Load user interest embedding from Qdrant ``user_profiles``.
-    2. Pull the candidate pool via ``CandidateRetriever`` (semantic Qdrant
-       search + trending PostgreSQL channel, merged and hydrated).
+    2. Pull the candidate pool via ``CandidateRetriever`` (approximate semantic
+       search + Qdrant-native discovery channels).
     3. Score every candidate with ``RankerService`` (MMoE heavy ranker).
-       All candidates (including trending) have valid vectors generated
-       on-the-fly and pass through the MMoE network.
-    4. Slice the top-ranked candidates into three batches of 15 and persist
-       them in the ``user_recommendation_batches`` Postgres table.
+       All candidates already carry their indexed repository vectors.
+    4. Slice the top-ranked candidates into three batches of 15 and return
+       them to the backend, which owns feed caching and invalidation.
 
     Caching
     -------
-    Generated batches are cached for 24 hours.  The cache is invalidated
-    automatically on upsert so that a fresh call always gets up-to-date
-    recommendations (e.g. after a feedback update by the feedback service).
+    The backend owns the Redis feed cache. The ML service intentionally does
+    has no connection to app-owned Postgres.
     """
 
     def __init__(
@@ -102,7 +71,6 @@ class RetrievalEngine:
         *,
         qdrant_url: str | None = None,
         qdrant_api_key: str | None = None,
-        db_connector: Any = None,
     ) -> None:
         self._url = qdrant_url or QDRANT_URL
         self._api_key = qdrant_api_key or QDRANT_API_KEY
@@ -111,25 +79,11 @@ class RetrievalEngine:
         self._client = QdrantClient(url=self._url, api_key=self._api_key, timeout=30.0)
 
         # Lazy-loaded sub-components
-        self._db = db_connector  # allow injection for testing
-        self._db_failed = False
         self._candidate_retriever: Any = None
         self._ranker: Any = None
         self._ranker_failed = False
 
     # ── Lazy sub-component accessors ──────────────────────────────────────────
-
-    @property
-    def db(self):
-        """Lazy-load the database connector to avoid import-time failures."""
-        if self._db is None and not self._db_failed:
-            try:
-                from database import PostgreSQLConnector
-                self._db = PostgreSQLConnector()
-            except Exception as exc:
-                logger.warning("Could not initialize PostgreSQLConnector: %s", exc)
-                self._db_failed = True
-        return self._db
 
     @property
     def candidate_retriever(self):
@@ -138,7 +92,6 @@ class RetrievalEngine:
             try:
                 from retrieval import CandidateRetriever
                 self._candidate_retriever = CandidateRetriever(
-                    db_connector=self.db,
                     qdrant_url=self._url,
                     qdrant_api_key=self._api_key,
                 )
@@ -173,7 +126,7 @@ class RetrievalEngine:
     def fetch_onboarding_batches(
         self, user_id: str, *, is_cold_start: bool = False
     ) -> dict[str, list[dict[str, Any]]]:
-        """Generate (or return cached) ranked recommendation batches for a user.
+        """Generate ranked recommendation batches for a user.
 
         Returns
         -------
@@ -182,56 +135,46 @@ class RetrievalEngine:
         """
         import time
 
-        # ── 1. Check cache ────────────────────────────────────────────────────
-        cached = self._load_cached_batches(user_id)
-        if cached is not None:
-            logger.info("Returning cached recommendation batches for '%s'.", user_id)
-            return cached
-
-        # ── 2. Get user profile from Qdrant ───────────────────────────────────
+        # ── 1. Get user profile from Qdrant ───────────────────────────────────
         try:
             user_vector, user_skills = self._get_user_profile(user_id)
         except ValueError:
             if is_cold_start:
-                logger.info("Cold start user '%s' vector not present. Using DB skills.", user_id)
+                logger.info("Cold start user '%s' has no Qdrant profile yet.", user_id)
                 user_vector = []
-                user_skills = self._get_user_skills_from_db(user_id)
+                user_skills = []
             else:
                 raise
         except Exception as exc:
-            # Catch connection errors (Qdrant down or network failure)
             logger.warning(
-                "User '%s' Qdrant lookup failed (%s). Falling back to DB skills.", 
+                "User '%s' Qdrant profile lookup failed (%s); using discovery retrieval.",
                 user_id, type(exc).__name__
             )
             user_vector = []
-            user_skills = self._get_user_skills_from_db(user_id)
-            # Force cold start pipeline if we completely lose Qdrant,
-            # as semantic ranking requires a valid vector anyway.
+            user_skills = []
             is_cold_start = True
 
         if is_cold_start:
             return self._cold_start_pipeline(user_id, user_vector, user_skills)
 
-        # ── 3. Retrieve candidate pool (Semantic + Trending) ──────────────────
+        # ── 2. Retrieve candidate pool (Semantic + Trending) ──────────────────
         start_retrieval = time.time()
         candidates = self._retrieve_candidates(user_vector, user_skills)
         retrieval_latency = (time.time() - start_retrieval) * 1000.0
 
-        # ── 4. Rank the candidate pool with the MMoE heavy ranker ─────────────
+        # ── 3. Rank the candidate pool with the MMoE heavy ranker ─────────────
         start_ranking = time.time()
         ranked = self._rank_candidates(user_vector, user_skills, candidates)
-        ranked = self._apply_user_feedback(user_id, ranked)
         ranking_latency = (time.time() - start_ranking) * 1000.0
 
-        # ── 5. Slice into 3 batches of BATCH_SIZE ─────────────────────────────
+        # ── 4. Slice into 3 batches of BATCH_SIZE ─────────────────────────────
         batches = {
             "batch_1": ranked[0:BATCH_SIZE],
             "batch_2": ranked[BATCH_SIZE: BATCH_SIZE * 2],
             "batch_3": ranked[BATCH_SIZE * 2: BATCH_SIZE * 3],
         }
 
-        # ── 6. Return to Backend for Redis Caching ────────────────────────────
+        # ── 5. Return to Backend for Redis Caching ────────────────────────────
 
         logger.info(
             "Generated onboarding batches for '%s': %d / %d / %d items.",
@@ -259,12 +202,11 @@ class RetrievalEngine:
         logger.info("Executing Cold Start pipeline for user '%s'", user_id)
         start_retrieval = time.time()
         
-        candidates = self._retrieve_cold_start_candidates(user_skills)
+        candidates = self._retrieve_candidates(user_vector, user_skills)
         retrieval_latency = (time.time() - start_retrieval) * 1000.0
 
         start_ranking = time.time()
         ranked = self._score_cold_start_candidates(user_skills, candidates)
-        ranked = self._apply_user_feedback(user_id, ranked)
         ranking_latency = (time.time() - start_ranking) * 1000.0
 
         batches = {
@@ -289,200 +231,6 @@ class RetrievalEngine:
             retrieval_latency + ranking_latency,
         )
         return batches
-
-    def _retrieve_cold_start_candidates(self, user_skills: list[str]) -> list[dict[str, Any]]:
-        """Query Postgres for high-quality skill-matched repos + trending fallbacks."""
-        from retrieval.config import COLD_START_SKILL_MATCH_LIMIT, COLD_START_TRENDING_LIMIT, COLD_START_MIN_STARS
-        import json
-
-        if not self.db or not self.db.enabled:
-            logger.warning("Database unavailable. Cold start retrieval returning empty.")
-            return []
-
-        conn = None
-        candidates = []
-        seen_repos = set()
-
-        # Normalise skills to lower-case for better matching
-        skills_lower = [s.lower() for s in user_skills]
-
-        try:
-            conn = self.db.connect()
-            cursor = conn.cursor()
-
-            # 1. Skill-matched query on Repo table
-            if skills_lower:
-                query = """
-                SELECT repo_id, full_name, description, repo_name,
-                       language_used, topics, readme_summary, star_count,
-                       forks_count, github_repo_url
-                FROM repo
-                WHERE (
-                    EXISTS (
-                        SELECT 1 FROM jsonb_array_elements_text(topics) AS t
-                        WHERE LOWER(t) = ANY(%s)
-                    )
-                    OR EXISTS (
-                        SELECT 1 FROM (
-                            SELECT jsonb_object_keys(language_used) AS l WHERE jsonb_typeof(language_used) = 'object'
-                            UNION ALL
-                            SELECT jsonb_array_elements_text(language_used) AS l WHERE jsonb_typeof(language_used) = 'array'
-                        ) sub WHERE LOWER(sub.l) = ANY(%s)
-                    )
-                )
-                AND star_count >= %s
-                ORDER BY star_count DESC
-                LIMIT %s;
-                """
-                cursor.execute(
-                    query,
-                    (skills_lower, skills_lower, COLD_START_MIN_STARS, COLD_START_SKILL_MATCH_LIMIT),
-                )
-                columns = [
-                    "repo_id", "full_name", "description", "repo_name",
-                    "language_used", "topics", "readme_summary", "star_count",
-                    "forks_count", "github_repo_url"
-                ]
-                for row in cursor.fetchall():
-                    row_dict = dict(zip(columns, row))
-                    if row_dict["full_name"] not in seen_repos:
-                        seen_repos.add(row_dict["full_name"])
-                        langs = row_dict["language_used"]
-                        if isinstance(langs, str):
-                            try:
-                                langs = json.loads(langs)
-                            except Exception:
-                                langs = []
-                        if isinstance(langs, dict):
-                            langs = list(langs.keys())
-                        elif not isinstance(langs, list):
-                            langs = []
-                        topics = row_dict["topics"]
-                        if isinstance(topics, str):
-                            try:
-                                topics = json.loads(topics)
-                            except Exception:
-                                topics = []
-                        
-                        candidates.append({
-                            "repo_id": str(row_dict["repo_id"]),
-                            "full_name": row_dict["full_name"],
-                            "repo_name": row_dict["repo_name"],
-                            "github_repo_url": row_dict["github_repo_url"],
-                            "description": row_dict["description"],
-                            "primary_language": langs[0] if langs else "Unknown",
-                            "languages": langs,
-                            "topics": topics if isinstance(topics, list) else [],
-                            "star_count": row_dict["star_count"],
-                            "forks_count": row_dict["forks_count"],
-                            "source": "cold_start_skills",
-                        })
-
-            # 2. Supplemental trending query
-            if len(candidates) < (BATCH_SIZE * NUM_BATCHES):
-                remaining_needed = (BATCH_SIZE * NUM_BATCHES) - len(candidates)
-                trending_limit = max(COLD_START_TRENDING_LIMIT, remaining_needed)
-                
-                query_trending = """
-                SELECT full_name, description, primary_language, topics,
-                       star_count, fork_count, url
-                FROM trending_repositories
-                ORDER BY trending_rank ASC
-                LIMIT %s;
-                """
-                try:
-                    cursor.execute(query_trending, (trending_limit,))
-                    for row in cursor.fetchall():
-                        full_name = row[0]
-                        if full_name not in seen_repos:
-                            seen_repos.add(full_name)
-                            topics = row[3]
-                            if isinstance(topics, str):
-                                try:
-                                    topics = json.loads(topics)
-                                except Exception:
-                                    topics = []
-                            candidates.append({
-                                "repo_id": full_name,
-                                "full_name": full_name,
-                                "github_repo_url": row[6] or f"https://github.com/{full_name}",
-                                "description": row[1] or "",
-                                "primary_language": row[2] or "Unknown",
-                                "topics": topics or [],
-                                "languages": [],
-                                "star_count": row[4] or 0,
-                                "forks_count": row[5] or 0,
-                                "source": "cold_start_trending",
-                            })
-                except Exception as exc:
-                    logger.warning("Failed to fetch trending repositories: %s", type(exc).__name__)
-                    conn.rollback()
-
-            # 3. Ultimate Fallback (Any Local Repos)
-            if len(candidates) < (BATCH_SIZE * NUM_BATCHES):
-                remaining_needed = (BATCH_SIZE * NUM_BATCHES) - len(candidates)
-                query_any = """
-                SELECT repo_id, full_name, description, repo_name,
-                       language_used, topics, readme_summary, star_count,
-                       forks_count, github_repo_url
-                FROM repo
-                ORDER BY RANDOM()
-                LIMIT 100;
-                """
-                cursor.execute(query_any)
-                columns = [
-                    "repo_id", "full_name", "description", "repo_name",
-                    "language_used", "topics", "readme_summary", "star_count",
-                    "forks_count", "github_repo_url"
-                ]
-                for row in cursor.fetchall():
-                    if len(candidates) >= (BATCH_SIZE * NUM_BATCHES):
-                        break
-                    row_dict = dict(zip(columns, row))
-                    if row_dict["full_name"] not in seen_repos:
-                        seen_repos.add(row_dict["full_name"])
-                        langs = row_dict["language_used"]
-                        if isinstance(langs, str):
-                            try:
-                                langs = json.loads(langs)
-                            except Exception:
-                                langs = []
-                        if isinstance(langs, dict):
-                            langs = list(langs.keys())
-                        elif not isinstance(langs, list):
-                            langs = []
-                        topics = row_dict["topics"]
-                        if isinstance(topics, str):
-                            try:
-                                topics = json.loads(topics)
-                            except Exception:
-                                topics = []
-
-                        candidates.append({
-                            "repo_id": str(row_dict["repo_id"]),
-                            "full_name": row_dict["full_name"],
-                            "repo_name": row_dict["repo_name"],
-                            "github_repo_url": row_dict["github_repo_url"],
-                            "description": row_dict["description"],
-                            "primary_language": langs[0] if langs else "Unknown",
-                            "languages": langs,
-                            "topics": topics if isinstance(topics, list) else [],
-                            "star_count": row_dict["star_count"],
-                            "forks_count": row_dict["forks_count"],
-                            "source": "cold_start_fallback",
-                        })
-
-            return candidates
-
-        except Exception as exc:
-            logger.error("Cold start retrieval failed: %s", exc)
-            return candidates
-        finally:
-            if conn:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
 
     def _score_cold_start_candidates(
         self, user_skills: list[str], candidates: list[dict]
@@ -535,32 +283,6 @@ class RetrievalEngine:
 
     # ── User profile retrieval ────────────────────────────────────────────────
 
-    def _get_user_skills_from_db(self, user_id: str) -> list[str]:
-        """Fallback to retrieve user skills directly from Postgres if Qdrant is missing."""
-        if not self.db or not self.db.enabled:
-            return []
-        conn = None
-        try:
-            conn = self.db.connect()
-            cursor = conn.cursor()
-            cursor.execute("SELECT skills, tech_stack FROM users WHERE user_id = %s;", (user_id,))
-            row = cursor.fetchone()
-            if not row:
-                return []
-            
-            import json
-            skills = row[0] if isinstance(row[0], list) else (json.loads(row[0]) if row[0] else [])
-            tech = row[1] if isinstance(row[1], list) else (json.loads(row[1]) if row[1] else [])
-            return skills + tech
-        except Exception as exc:
-            logger.error("Failed to get user skills from DB: %s", exc)
-            return []
-        finally:
-            if conn:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
 
     def _get_user_profile(self, user_id: str) -> tuple[list[float], list[str]]:
         """Return (interest_vector, skills_list) for a user from Qdrant.
@@ -680,17 +402,6 @@ class RetrievalEngine:
         except Exception as exc:
             logger.error("CandidateRetriever.retrieve_candidates failed: %s", exc)
             return []
-
-    def _apply_user_feedback(
-        self, user_id: str, candidates: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
-        """Blend persisted explicit feedback into an already-ranked pool."""
-        try:
-            scores = FeedbackStore(self.db).scores_for_user(user_id)
-        except Exception as exc:
-            logger.warning("Could not load feedback for '%s': %s", user_id, exc)
-            return candidates
-        return apply_feedback_scores(candidates, scores)
 
     # ── MMoE Ranking ──────────────────────────────────────────────────────────
 
@@ -838,108 +549,6 @@ class RetrievalEngine:
             enriched[0]["final_score"] if enriched else 0.0,
         )
         return enriched
-
-    # ── Postgres persistence ──────────────────────────────────────────────────
-
-    def _ensure_recommendations_table(self, conn) -> None:
-        """Create the recommendation batches table if it doesn't exist."""
-        cursor = conn.cursor()
-        try:
-            cursor.execute(_CREATE_TABLE_SQL)
-            conn.commit()
-        except Exception as exc:
-            logger.warning("Could not create %s table: %s", _RECOMMENDATIONS_TABLE, exc)
-            conn.rollback()
-
-    def _persist_batches(
-        self,
-        user_id: str,
-        batches: dict[str, list[dict[str, Any]]],
-    ) -> bool:
-        """Upsert the recommendation batches into Postgres."""
-        db = self.db
-        if db is None or not db.enabled:
-            logger.info("DATABASE_URL not set; skipping batch persistence.")
-            return False
-
-        conn = None
-        try:
-            conn = db.connect()
-            self._ensure_recommendations_table(conn)
-
-            cursor = conn.cursor()
-            batch_json = json.dumps(batches, default=str)
-
-            cursor.execute("SAVEPOINT batch_upsert;")
-            cursor.execute(_UPSERT_SQL, (user_id, batch_json))
-            cursor.execute("RELEASE SAVEPOINT batch_upsert;")
-
-            conn.commit()
-            logger.info("Persisted recommendation batches for '%s' to Postgres.", user_id)
-            return True
-
-        except Exception as exc:
-            logger.error("Failed to persist batches for '%s': %s", user_id, exc)
-            if conn:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-            return False
-
-        finally:
-            if conn:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-
-    def _load_cached_batches(
-        self,
-        user_id: str,
-    ) -> dict[str, list[dict[str, Any]]] | None:
-        """Load previously persisted batches from Postgres, or None if missing."""
-        db = self.db
-        if db is None or not db.enabled:
-            return None
-
-        conn = None
-        try:
-            conn = db.connect()
-            self._ensure_recommendations_table(conn)
-
-            cursor = conn.cursor()
-            cursor.execute(_SELECT_SQL, (user_id,))
-            row = cursor.fetchone()
-
-            if row is None:
-                return None
-
-            data = row[0]
-            if isinstance(data, str):
-                data = json.loads(data)
-
-            required_batches = {"batch_1", "batch_2", "batch_3"}
-            if (
-                isinstance(data, dict)
-                and required_batches.issubset(data)
-                and all(isinstance(data[key], list) for key in required_batches)
-            ):
-                logger.info("Loaded cached batches for '%s' from Postgres.", user_id)
-                return data
-
-            return None
-
-        except Exception as exc:
-            logger.debug("Cache lookup failed for '%s': %s", user_id, exc)
-            return None
-
-        finally:
-            if conn:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
 
     # ── Utility: list onboarded users ─────────────────────────────────────────
 

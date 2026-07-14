@@ -1,0 +1,16 @@
+.git
+.github
+.codex
+.env
+.env.*
+!.env.example
+.pytest_cache
+__pycache__
+*.py[cod]
+*.log
+*.sqlite*
+.DS_Store
+tests
+docs
+project_context.md
+PRODUCTION_FUNCTIONALITY_ROADMAP.md

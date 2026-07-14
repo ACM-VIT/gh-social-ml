@@ -1,0 +1,9 @@
+# Runtime dependencies for the deployed FastAPI/Qdrant service.
+python-dotenv
+requests
+numpy
+sentence-transformers
+qdrant-client
+fastapi>=0.110.0
+uvicorn>=0.28.0
+redis>=5.0.0

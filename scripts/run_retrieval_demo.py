@@ -2,7 +2,6 @@ import logging
 import random
 from dotenv import load_dotenv
 
-from database.connector import PostgreSQLConnector
 from retrieval.candidate_retriever import CandidateRetriever
 
 # Setup logging
@@ -12,14 +11,8 @@ logger = logging.getLogger("demo.retrieval")
 def main():
     load_dotenv()
     
-    logger.info("Initializing database connector...")
-    db = PostgreSQLConnector()
-    if not db.enabled or not db.verify_connection():
-        logger.error("PostgreSQL is not running or not configured properly. Check DATABASE_URL in .env.")
-        return
-        
     logger.info("Initializing CandidateRetriever...")
-    retriever = CandidateRetriever(db_connector=db)
+    retriever = CandidateRetriever()
     
     # Generate a random 384-dimensional normalized vector for the mock user persona
     random.seed(42)
@@ -49,9 +42,12 @@ def main():
         logger.info(f"  {i}. score={c.get('retrieval_score', 0):.4f} repo={c.get('full_name')} (ID: {c.get('repo_id')})")
         
     # Print trending candidates
-    trending_cand = [c for c in candidates if c.get("retrieval_source") == "trending"]
-    logger.info(f"Trending candidates count: {len(trending_cand)}")
-    for i, c in enumerate(trending_cand[:5], 1):
+    discovery_cand = [
+        c for c in candidates
+        if str(c.get("retrieval_source", "")).startswith("discovery")
+    ]
+    logger.info(f"Discovery candidates count: {len(discovery_cand)}")
+    for i, c in enumerate(discovery_cand[:5], 1):
         logger.info(f"  {i}. stars={c.get('star_count', 0)} repo={c.get('full_name')} (ID: {c.get('repo_id')})")
         
     # Print fallback candidates
