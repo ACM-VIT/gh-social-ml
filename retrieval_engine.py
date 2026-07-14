@@ -29,6 +29,7 @@ except ImportError:
     pass
 
 from qdrant_client import QdrantClient
+from feedback.storage import FeedbackStore, apply_feedback_scores
 
 from config import (  # type: ignore
     QDRANT_API_KEY,
@@ -165,6 +166,7 @@ class RetrievalEngine:
         # ── 3. Rank the candidate pool with the MMoE heavy ranker ─────────────
         start_ranking = time.time()
         ranked = self._rank_candidates(user_vector, user_skills, candidates)
+        ranked = self._apply_user_feedback(user_id, ranked)
         ranking_latency = (time.time() - start_ranking) * 1000.0
 
         # ── 4. Slice into 3 batches of BATCH_SIZE ─────────────────────────────
@@ -207,6 +209,7 @@ class RetrievalEngine:
 
         start_ranking = time.time()
         ranked = self._score_cold_start_candidates(user_skills, candidates)
+        ranked = self._apply_user_feedback(user_id, ranked)
         ranking_latency = (time.time() - start_ranking) * 1000.0
 
         batches = {
@@ -402,6 +405,17 @@ class RetrievalEngine:
         except Exception as exc:
             logger.error("CandidateRetriever.retrieve_candidates failed: %s", exc)
             return []
+
+    def _apply_user_feedback(
+        self, user_id: str, candidates: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Blend persisted explicit feedback into an already-ranked pool."""
+        try:
+            scores = FeedbackStore(self.db).scores_for_user(user_id)
+        except Exception as exc:
+            logger.warning("Could not load feedback for '%s': %s", user_id, exc)
+            return candidates
+        return apply_feedback_scores(candidates, scores)
 
     # ── MMoE Ranking ──────────────────────────────────────────────────────────
 

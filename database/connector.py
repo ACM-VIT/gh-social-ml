@@ -62,7 +62,8 @@ class PostgreSQLConnector:
     def __init__(self, database_url: str | None = None) -> None:
         self.database_url = database_url or os.getenv("DATABASE_URL")
         self.enabled = bool(self.database_url)
-        self._conn: Any = None
+        import threading
+        self._local = threading.local()
 
         if not self.enabled:
             logger.warning(
@@ -157,23 +158,24 @@ class PostgreSQLConnector:
 
     def _get_connection(self) -> pg8000.dbapi.Connection:
         """Get a reusable connection, reconnecting if the previous one is stale."""
-        if self._conn is not None:
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
             try:
                 # Lightweight health-check
-                cursor = self._conn.cursor()
+                cursor = conn.cursor()
                 cursor.execute("SELECT 1")
                 cursor.fetchone()
-                return self._conn
+                return conn
             except Exception:
                 # Connection is dead — close and reconnect
                 try:
-                    self._conn.close()
+                    conn.close()
                 except Exception:
                     pass
-                self._conn = None
+                self._local.conn = None
 
-        self._conn = self.connect()
-        return self._conn
+        self._local.conn = self.connect()
+        return self._local.conn
 
     def verify_connection(self) -> bool:
         """Test the database connection and return True if successful.

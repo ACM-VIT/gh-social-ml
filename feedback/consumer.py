@@ -76,23 +76,45 @@ class FeedbackConsumer:
                 dwell_seconds_raw = event.get("dwell_seconds")
                 dwell_seconds = float(dwell_seconds_raw) if dwell_seconds_raw is not None else None
 
+                # Generate a stable message_id if one doesn't exist, so local retries
+                # can still benefit from replay guards if Redis becomes available.
+                if "message_id" not in event:
+                    import uuid
+                    event["message_id"] = f"local-{uuid.uuid4().hex}"
+                
+                message_id = event["message_id"]
+
                 if not user_id or not repo_id or not action:
                     queue.task_done()
                     continue
 
                 # Process feedback in a background thread to prevent blocking the asyncio event loop
+                success = False
                 try:
                     loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(
+                    success = await loop.run_in_executor(
                         None,
                         lambda: self.handler.handle_feedback(
-                            user_id, repo_id, action, dwell_seconds=dwell_seconds
+                            user_id, repo_id, action, dwell_seconds=dwell_seconds, message_id=message_id
                         )
                     )
                 except Exception as exc:
                     logger.error("Exception occurred while handling feedback: %s", exc)
-                finally:
-                    queue.task_done()
+                if not success:
+                    # Retry in-memory events indefinitely with exponential backoff 
+                    # in a background task so we don't starve the queue.
+                    retries = event.get("retries", 0) + 1
+                    event["retries"] = retries
+                    logger.warning("Local queue event failed. Re-queueing. Attempt %d", retries)
+                    
+                    async def delayed_requeue(evt, r):
+                        delay = min(60, 2 ** r)
+                        await asyncio.sleep(delay)
+                        await queue.put(evt)
+                        
+                    asyncio.create_task(delayed_requeue(event, retries))
+                
+                queue.task_done()
 
             except asyncio.CancelledError:
                 break
@@ -209,26 +231,25 @@ class FeedbackConsumer:
                             else:
                                 processed_success = False
                                 try:
-                                    # Execute the ML-owned user-vector update.
-                                    handler_succeeded = await loop.run_in_executor(
+                                    # Execute vector updates and metric increments
+                                    processed_success = await loop.run_in_executor(
                                         None,
                                         lambda: self.handler.handle_feedback(
                                             user_id, repo_id, action,
                                             dwell_seconds=dwell_seconds,
+                                            message_id=message_id,
                                         ),
                                     )
-                                    if not handler_succeeded:
-                                        raise RuntimeError("Feedback handler rejected the event")
-                                    processed_success = True
                                     
-                                    # Mark as processed in Redis (expires in 24 hours)
-                                    try:
-                                        await loop.run_in_executor(
-                                            None,
-                                            lambda: self.redis_client.set(processed_key, "1", ex=86400)
-                                        )
-                                    except Exception as set_exc:
-                                        logger.warning("Failed to mark message %s as processed in Redis: %s", message_id, set_exc)
+                                    if processed_success:
+                                        # Mark as processed in Redis (expires in 24 hours)
+                                        try:
+                                            await loop.run_in_executor(
+                                                None,
+                                                lambda: self.redis_client.set(processed_key, "1", ex=86400)
+                                            )
+                                        except Exception as set_exc:
+                                            logger.warning("Failed to mark message %s as processed in Redis: %s", message_id, set_exc)
                                 except Exception as exc:
                                     logger.error("Exception handling Redis Stream feedback: %s", exc)
 
