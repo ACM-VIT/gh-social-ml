@@ -14,6 +14,7 @@ class InteractionDefinition:
     realtime: bool = True
     reversal_of: str | None = None
     state_family: str | None = None
+    apply_once: bool = False
 
     @property
     def feedback_score(self) -> float:
@@ -42,9 +43,9 @@ class InteractionDefinition:
 _INTERACTIONS = {
     "impression": InteractionDefinition(0.0, 0.0, realtime=False),
     "dwell": InteractionDefinition(0.0, 0.0),
-    "readme_open": InteractionDefinition(0.2, 0.05),
-    "github_open": InteractionDefinition(0.3, 0.07),
-    "share": InteractionDefinition(0.6, 0.10),
+    "readme_open": InteractionDefinition(0.2, 0.05, apply_once=True),
+    "github_open": InteractionDefinition(0.3, 0.07, apply_once=True),
+    "share": InteractionDefinition(0.6, 0.10, apply_once=True),
     "like": InteractionDefinition(1.0, 0.15, state_family="reaction"),
     "unlike": InteractionDefinition(0.0, 0.0, reversal_of="like", state_family="reaction"),
     "dislike": InteractionDefinition(-1.0, -0.15, state_family="reaction"),

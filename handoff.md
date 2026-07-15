@@ -2,11 +2,11 @@
 
 ## Status
 
-The Person 5 online feedback/API workstream has been implemented locally but has not
-been committed, pushed, or opened as a pull request.
+The Person 5 online feedback/API workstream has been implemented and committed locally,
+but has not been pushed or opened as a pull request.
 
 The focused Person 5 suite and the existing feedback-scoring/retrieval compatibility
-tests pass: **33 passed**. The full repository suite completed with **165 passed and 8
+tests pass: **37 passed**. The full repository suite previously completed with **165 passed and 8
 unrelated failures** caused by blocked external GitHub access and Windows logger-file
 cleanup. See **Verification** below before merging.
 
@@ -79,6 +79,7 @@ Its payload stores:
 - `feedback_latent_vector`: the unnormalized working vector;
 - `feedback_adjustments`: exact active reversible deltas, separated into reaction and
   save families;
+- `feedback_applied_signals`: compact per-repository markers for one-time passive signals;
 - `feedback_processed_events`: a bounded durable replay guard.
 
 The normalized vector remains the Qdrant search vector. The normalized vector, latent
@@ -95,6 +96,10 @@ Exact action-state behavior:
 - switching like to dislike, or dislike to like, removes the previous delta before
   calculating and adding the new delta;
 - save state is independent and can coexist with either reaction;
+- `readme_open`, `github_open`, and `share` update each user/repository profile only once;
+- later occurrences of those passive actions remain valid telemetry but do not shift the
+  vector again;
+- distinct qualifying dwell events continue to update the profile;
 - duplicate `event_id` does not update the vector again;
 - missing user/repository points are retryable failures, not zero-vector fallbacks;
 - wrong-dimensional, zero, NaN, or infinite vectors are rejected.
@@ -318,7 +323,7 @@ python -m pytest tests\test_feedback.py tests\test_online_architecture.py `
 Result:
 
 ```text
-33 passed, 2 warnings
+37 passed, 2 warnings
 ```
 
 The warnings were unrelated dependency deprecations:
@@ -332,6 +337,8 @@ Coverage includes:
 - PDF vector formula and normalization;
 - invalid vector handling;
 - dwell thresholds/cap;
+- one-time readme-open, GitHub-open, and share learning per user/repository;
+- continued learning from distinct qualifying dwell events;
 - exact like/unlike, dislike/undislike, and save/unsave reversal;
 - reaction switching and save independence;
 - duplicate event/state handling;
@@ -392,12 +399,13 @@ handler-cleanup issue is resolved.
 4. **Distributed lock lease:** the per-user lock defaults to 60 seconds. If Qdrant updates
    can exceed this, increase the lease or implement lease renewal before horizontal scaling.
 
-5. **Dwell policy approval:** the current function is linear from 3 to 300 seconds and caps
-   at 0.15. These values and the linear shape still require product/ML approval.
+5. **Dwell policy tuning:** dwell is approved as a repeatable learning signal. The current
+   function is linear from 3 to 300 seconds and caps at 0.15; tune these production values
+   if observed behavior warrants it.
 
-6. **Passive-signal repetition:** `readme_open`, `github_open`, `share`, and qualifying
-   dwell events apply once per unique `event_id`. There is no per-user/repository time-window
-   cap beyond event idempotency. Confirm whether repeated genuine events should accumulate.
+6. **Passive-signal repetition:** the product decision is implemented. `readme_open`,
+   `github_open`, and `share` apply once per user/repository regardless of new event IDs.
+   Qualifying dwell events remain repeatable learning signals.
 
 7. **Telemetry ownership:** `impression` is accepted but intentionally not published to the
    real-time stream. Confirm that the backend/offline pipeline persists it for training.
@@ -423,7 +431,8 @@ handler-cleanup issue is resolved.
 1. Wait for/finalize the Person 2 Qdrant identity, vector-name, and collection contract.
 2. Agree with Person 6 on the event schema, secret header, state-transition behavior, and
    impression/offline-telemetry ownership.
-3. Approve dwell thresholds/function and passive-event repetition/capping.
+3. Tune dwell thresholds/function if production observations require it; passive-event
+   repetition is already resolved and implemented.
 4. Re-run the eight unrelated full-suite failures in an environment with GitHub network
    access and corrected Windows logger-handler cleanup.
 5. Run Redis/Qdrant integration tests using production-compatible versions.
@@ -434,7 +443,7 @@ handler-cleanup issue is resolved.
 8. Make the final shared dependency/CI commit after all ML feature branches merge.
 9. Exclude the pre-existing unrelated `app.py` modification from the Person 5 commit.
 
-## No external actions taken
+## No remote actions taken
 
-No commit, push, pull request, deployment, database change, Redis mutation, or Qdrant
-mutation was performed as part of this local implementation.
+Local commits were created for the Person 5 work. No push, pull request, deployment,
+database change, Redis mutation, or Qdrant mutation was performed.

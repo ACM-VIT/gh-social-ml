@@ -19,6 +19,7 @@ logger = logging.getLogger("pipeline.feedback")
 LATENT_KEY = "feedback_latent_vector"
 ADJUSTMENTS_KEY = "feedback_adjustments"
 PROCESSED_KEY = "feedback_processed_events"
+APPLIED_SIGNALS_KEY = "feedback_applied_signals"
 
 
 def dwell_alpha(
@@ -190,6 +191,9 @@ class FeedbackHandler:
         )
         adjustments: dict[str, Any] = copy.deepcopy(payload.get(ADJUSTMENTS_KEY, {}))
         repo_state = adjustments.setdefault(repo_id, {})
+        applied_signals: dict[str, list[str]] = copy.deepcopy(
+            payload.get(APPLIED_SIGNALS_KEY, {})
+        )
 
         if action == "dwell":
             if dwell_seconds is None:
@@ -242,6 +246,19 @@ class FeedbackHandler:
                     "event_id": event_id,
                 }
                 changed = True
+        elif definition.apply_once:
+            repo_signals = applied_signals.setdefault(repo_id, [])
+            if action not in repo_signals:
+                repository = self._repository_vector(repo_id)
+                if repository is None:
+                    return False
+                latent += _vector(
+                    vector_delta(latent, repository, alpha),
+                    self.settings.vector_dimension,
+                    label="feedback delta",
+                )
+                repo_signals.append(action)
+                changed = True
         elif alpha != 0.0:
             repository = self._repository_vector(repo_id)
             if repository is None:
@@ -258,6 +275,7 @@ class FeedbackHandler:
         processed.append(event_id)
         payload[LATENT_KEY] = latent.tolist()
         payload[ADJUSTMENTS_KEY] = adjustments
+        payload[APPLIED_SIGNALS_KEY] = applied_signals
         payload[PROCESSED_KEY] = processed[-self.settings.processed_event_history :]
         normalized = normalize_vector(latent, self.settings.vector_dimension)
         final_vector: Any = {vector_name: normalized} if vector_name else normalized

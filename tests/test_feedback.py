@@ -17,6 +17,7 @@ import api.main as api_main
 from feedback.consumer import FeedbackConsumer
 from feedback.event_handlers import (
     ADJUSTMENTS_KEY,
+    APPLIED_SIGNALS_KEY,
     LATENT_KEY,
     FeedbackHandler,
     dwell_alpha,
@@ -88,6 +89,8 @@ def test_action_registry_is_complete_and_immutable():
     assert get_interaction("dislike").embedding_alpha == -0.15
     assert get_interaction("save").embedding_alpha == 0.20
     assert get_interaction("impression").realtime is False
+    assert get_interaction("readme_open").apply_once is True
+    assert get_interaction("dwell").apply_once is False
     with pytest.raises(TypeError):
         INTERACTIONS["new"] = get_interaction("like")
     with pytest.raises(ValueError):
@@ -166,6 +169,34 @@ def test_duplicate_event_and_duplicate_state_do_not_shift_twice(settings):
     assert qdrant.upserts == upserts
     assert handler.handle_feedback(USER_ID, REPO_ID, "like", event_id="different")
     assert qdrant.user.payload[LATENT_KEY] == pytest.approx(latent)
+
+
+@pytest.mark.parametrize("action", ["readme_open", "github_open", "share"])
+def test_passive_action_updates_once_per_user_repository(settings, action):
+    qdrant = FakeQdrant()
+    handler = FeedbackHandler(qdrant_client=qdrant, settings=settings)
+    assert handler.handle_feedback(USER_ID, REPO_ID, action, event_id=f"{action}-1")
+    latent = list(qdrant.user.payload[LATENT_KEY])
+    repo_reads = qdrant.repo_reads
+
+    assert qdrant.user.payload[APPLIED_SIGNALS_KEY][REPO_ID] == [action]
+    assert handler.handle_feedback(USER_ID, REPO_ID, action, event_id=f"{action}-2")
+    assert qdrant.user.payload[LATENT_KEY] == pytest.approx(latent)
+    assert qdrant.repo_reads == repo_reads
+
+
+def test_distinct_dwell_events_continue_learning(settings):
+    qdrant = FakeQdrant()
+    handler = FeedbackHandler(qdrant_client=qdrant, settings=settings)
+    assert handler.handle_feedback(
+        USER_ID, REPO_ID, "dwell", event_id="dwell-1", dwell_seconds=30
+    )
+    first_latent = list(qdrant.user.payload[LATENT_KEY])
+    assert handler.handle_feedback(
+        USER_ID, REPO_ID, "dwell", event_id="dwell-2", dwell_seconds=30
+    )
+    assert qdrant.user.payload[LATENT_KEY] != pytest.approx(first_latent)
+    assert qdrant.repo_reads == 2
 
 
 def test_missing_user_or_repository_is_retryable(settings):
