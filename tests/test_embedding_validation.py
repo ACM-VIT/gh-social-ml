@@ -12,6 +12,7 @@ from embedding.vector_contract import resolve_repository_identity, validate_embe
 
 
 EMBEDDING_DIM = 384
+REPO_ID = "00000000-0000-4000-8000-000000000001"
 
 
 class FakeEmbedder:
@@ -38,7 +39,9 @@ class UnusedStore:
 
 def _repository(**overrides):
     repo = {
-        "repo_id": "repo-123",
+        "repo_id": REPO_ID,
+        "github_id": "123456789",
+        "content_version": 7,
         "full_name": "owner/repository",
         "description": "A documented machine-learning repository.",
         "primary_language": "Python",
@@ -60,33 +63,39 @@ def test_pipeline_emits_finite_normalized_vector_and_canonical_identity():
         _repository()
     )
 
-    assert result.repo_id == "repo-123"
-    assert result.payload["repo_id"] == "repo-123"
+    assert result.repo_id == REPO_ID
+    assert result.payload["repo_id"] == REPO_ID
     assert result.payload["full_name"] == "owner/repository"
     assert len(result.final_embedding) == EMBEDDING_DIM
     assert all(math.isfinite(value) for value in result.final_embedding)
     assert math.sqrt(sum(value * value for value in result.final_embedding)) == pytest.approx(1.0)
 
 
-def test_legacy_acquisition_identity_remains_supported():
+def test_payload_tags_use_repository_name_instead_of_backend_uuid():
+    result = RepositoryEmbeddingPipeline(embedder=FakeEmbedder()).embed_repository(
+        _repository(full_name="owner/vector-search-engine")
+    )
+
+    assert {"vector", "search", "engine"}.issubset(result.payload["tags"])
+
+
+def test_full_name_cannot_be_used_as_a_canonical_repository_id():
     repo = _repository()
     repo.pop("repo_id")
     repo.pop("full_name")
     repo["id"] = "owner/repository"
 
-    assert resolve_repository_identity(repo) == ("owner/repository", "owner/repository")
-    result = RepositoryEmbeddingPipeline(embedder=FakeEmbedder()).embed_repository(repo)
-    assert result.payload["repo_id"] == "owner/repository"
-    assert result.payload["full_name"] == "owner/repository"
+    with pytest.raises(ValueError, match="backend-issued UUID"):
+        RepositoryEmbeddingPipeline(embedder=FakeEmbedder()).embed_repository(repo)
 
 
 @pytest.mark.parametrize(
     "repo",
     [
         {},
-        {"repo_id": "repo-123"},
-        {"repo_id": "repo-123", "full_name": "not-a-full-name"},
-        {"repo_id": "repo-123", "full_name": "owner/repository/extra"},
+        {"repo_id": REPO_ID},
+        {"repo_id": REPO_ID, "full_name": "not-a-full-name"},
+        {"repo_id": REPO_ID, "full_name": "owner/repository/extra"},
     ],
 )
 def test_invalid_or_incomplete_repository_identity_is_rejected(repo):
@@ -171,7 +180,7 @@ def test_payload_normalizes_supported_values_and_timestamps():
             topics='["machine-learning", "vectors"]',
             created_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
         ),
-        repo_id="repo-123",
+        repo_id=REPO_ID,
         final_embedding=[1.0] + [0.0] * (EMBEDDING_DIM - 1),
         readme_chunks=1,
         source_hash="source-hash",
@@ -181,6 +190,11 @@ def test_payload_normalizes_supported_values_and_timestamps():
     assert payload["star_count"] == 10
     assert payload["topics"] == ["machine-learning", "vectors"]
     assert payload["created_at"] == "2026-07-15T00:00:00+00:00"
+    assert payload["github_id"] == "123456789"
+    assert payload["content_version"] == 7
+    assert payload["content_hash"] == "source-hash"
+    assert payload["model_version"] == payload["embedding_model"]
+    assert payload["indexed_at"].endswith("+00:00")
 
 
 @pytest.mark.parametrize(
@@ -190,13 +204,16 @@ def test_payload_normalizes_supported_values_and_timestamps():
         ({"fork_count": 2.5}, "fork_count"),
         ({"delta_3d": True}, "delta_3d"),
         ({"created_at": "not-a-timestamp"}, "created_at"),
+        ({"created_at": "2026-07-15T00:00:00+05:30"}, "UTC"),
+        ({"github_id": "github-123"}, "github_id"),
+        ({"content_version": -1}, "content_version"),
     ],
 )
 def test_payload_rejects_invalid_numeric_and_timestamp_values(overrides, message):
     with pytest.raises((TypeError, ValueError), match=message):
         build_vector_payload(
             _repository(**overrides),
-            repo_id="repo-123",
+            repo_id=REPO_ID,
             final_embedding=[1.0] + [0.0] * (EMBEDDING_DIM - 1),
             readme_chunks=1,
             source_hash="source-hash",

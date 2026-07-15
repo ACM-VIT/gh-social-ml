@@ -1,6 +1,7 @@
 from .embedding_pipeline import RepositoryEmbeddingPipeline, embed_repositories, index_repositories
 from .repository_embedding import RepositoryEmbeddingConfig, RepositoryEmbeddingResult
 from .qdrant_store import QdrantRepositoryStore
+from .user_profile_store import QdrantUserProfileStore
 from .vector_contract import (
     REPOSITORY_COLLECTION_CONTRACT,
     REPOSITORY_DISCOVERY_CHANNELS,
@@ -8,6 +9,7 @@ from .vector_contract import (
     REPOSITORY_PAYLOAD_REQUIRED_FIELDS,
     USER_PROFILE_COLLECTION_CONTRACT,
     VectorCollectionContract,
+    canonical_backend_uuid,
     repository_payload_defaults,
     repository_point_id,
     resolve_repository_identity,
@@ -21,9 +23,11 @@ __all__ = [
     "RepositoryEmbeddingConfig",
     "RepositoryEmbeddingResult",
     "QdrantRepositoryStore",
+    "QdrantUserProfileStore",
     "embed_repositories",
     "index_repositories",
     "VectorCollectionContract",
+    "canonical_backend_uuid",
     "REPOSITORY_COLLECTION_CONTRACT",
     "REPOSITORY_DISCOVERY_CHANNELS",
     "USER_PROFILE_COLLECTION_CONTRACT",

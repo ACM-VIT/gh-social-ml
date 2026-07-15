@@ -39,7 +39,11 @@ def main():
                 topics = []
                 
         approved.append({
-            "id": row[1], # full_name
+            # repo_id is the backend-issued canonical UUID. full_name is only
+            # searchable/display metadata and must never become the point key.
+            "id": str(row[0]),
+            "repo_id": str(row[0]),
+            "full_name": row[1],
             "description": row[2] or "",
             "primary_language": row[3] or "Unknown",
             "topics": topics or [],

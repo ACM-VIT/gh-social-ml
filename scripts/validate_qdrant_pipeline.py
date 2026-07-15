@@ -15,9 +15,13 @@ from embedding.repository_embedding import RepositoryEmbeddingConfig
 
 
 SAMPLE_REPOSITORY = {
-    # The below payload is for validating the same shape emitted by
-    # RepositoryEnricher.to_osiris_payload.
-    "id": "sample/repository-embedding-demo",
+    # This is the shape acquisition must emit after receiving the canonical
+    # backend repository mapping.
+    "id": "00000000-0000-4000-8000-000000000001",
+    "repo_id": "00000000-0000-4000-8000-000000000001",
+    "github_id": "123456789",
+    "full_name": "sample/repository-embedding-demo",
+    "content_version": 1,
     "description": "Sample repository used to validate README, metadata, topic, and Qdrant vector indexing.",
     "primary_language": "Python",
     "star_count": 128,

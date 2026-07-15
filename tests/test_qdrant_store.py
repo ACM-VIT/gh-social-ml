@@ -15,6 +15,8 @@ from embedding.vector_contract import (
 
 EMBEDDING_DIM = 384
 VECTOR_NAME = "repo_embedding"
+REPO_ID = "00000000-0000-4000-8000-000000000001"
+OTHER_REPO_ID = "00000000-0000-4000-8000-000000000002"
 
 
 def _vector(value=1.0):
@@ -162,7 +164,7 @@ def test_payload_index_creation_failure_is_not_silently_ignored():
 
 def test_semantic_search_uses_named_approximate_vector_and_normalizes_output():
     client = FakeQdrantClient()
-    client.query_response = [_point("repo-1", score=0.91)]
+    client.query_response = [_point(REPO_ID, score=0.91)]
     store = _store(client)
 
     results = store.semantic_search(_vector(), limit=7)
@@ -171,7 +173,7 @@ def test_semantic_search_uses_named_approximate_vector_and_normalizes_output():
     assert client.query_kwargs["limit"] == 7
     assert client.query_kwargs["search_params"].exact is False
     assert client.query_kwargs["with_vectors"] is True
-    assert results[0]["repo_id"] == "repo-1"
+    assert results[0]["repo_id"] == REPO_ID
     assert results[0]["score"] == pytest.approx(0.91)
     assert results[0]["vector"] == _vector()
 
@@ -190,7 +192,7 @@ def test_search_rejects_bad_vectors_before_calling_qdrant():
 )
 def test_discover_orders_each_frozen_channel_descending(channel, field_name):
     client = FakeQdrantClient()
-    client.scroll_response = [_point("repo-1")]
+    client.scroll_response = [_point(REPO_ID)]
     store = _store(client)
 
     results = store.discover(channel, limit=4)
@@ -199,7 +201,7 @@ def test_discover_orders_each_frozen_channel_descending(channel, field_name):
     assert order_by.key == field_name
     assert order_by.direction == models.Direction.DESC
     assert client.scroll_kwargs["with_vectors"] == [VECTOR_NAME]
-    assert results[0]["repo_id"] == "repo-1"
+    assert results[0]["repo_id"] == REPO_ID
 
 
 def test_discover_rejects_unknown_channel():
@@ -209,17 +211,29 @@ def test_discover_rejects_unknown_channel():
 
 def test_retrieve_batch_deduplicates_request_and_restores_caller_order():
     client = FakeQdrantClient()
-    client.retrieve_response = [_point("repo-2"), _point("repo-1")]
+    client.retrieve_response = [_point(OTHER_REPO_ID), _point(REPO_ID)]
     store = _store(client)
 
-    results = store.retrieve_batch(["repo-1", "repo-2", "repo-1"])
+    results = store.retrieve_batch([REPO_ID, OTHER_REPO_ID, REPO_ID])
 
     assert client.retrieve_kwargs["ids"] == [
-        repository_point_id("repo-1"),
-        repository_point_id("repo-2"),
+        repository_point_id(REPO_ID),
+        repository_point_id(OTHER_REPO_ID),
     ]
     assert client.retrieve_kwargs["with_vectors"] == [VECTOR_NAME]
-    assert [result["repo_id"] for result in results] == ["repo-1", "repo-2"]
+    assert [result["repo_id"] for result in results] == [REPO_ID, OTHER_REPO_ID]
+
+
+def test_retrieve_batch_canonicalizes_uuid_case_before_deduplication():
+    repo_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    client = FakeQdrantClient()
+    client.retrieve_response = [_point(repo_id)]
+    store = _store(client)
+
+    results = store.retrieve_batch([repo_id.upper(), repo_id])
+
+    assert client.retrieve_kwargs["ids"] == [repository_point_id(repo_id)]
+    assert [result["repo_id"] for result in results] == [repo_id]
 
 
 @pytest.mark.parametrize("repo_ids", ["repo-1", [""], [123]])

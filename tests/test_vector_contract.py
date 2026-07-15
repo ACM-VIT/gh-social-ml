@@ -17,10 +17,14 @@ from embedding.vector_contract import (
     REPOSITORY_PAYLOAD_FIELD_TYPES,
     REPOSITORY_PAYLOAD_REQUIRED_FIELDS,
     USER_PROFILE_COLLECTION_CONTRACT,
+    canonical_backend_uuid,
     repository_payload_defaults,
     repository_point_id,
     user_point_id,
 )
+
+REPO_ID = "00000000-0000-4000-8000-000000000001"
+OTHER_REPO_ID = "00000000-0000-4000-8000-000000000002"
 
 
 def test_repository_collection_contract_matches_central_config():
@@ -40,13 +44,20 @@ def test_user_collection_contract_preserves_existing_unnamed_vector():
 
 
 def test_point_ids_are_deterministic_and_namespaced():
-    assert repository_point_id("repo-123") == repository_point_id(" repo-123 ")
-    assert user_point_id("repo-123") == user_point_id(" repo-123 ")
-    assert repository_point_id("repo-123") != user_point_id("repo-123")
-    assert repository_point_id("repo-123") != repository_point_id("repo-456")
+    assert repository_point_id(REPO_ID) == repository_point_id(f" {REPO_ID} ")
+    assert user_point_id(REPO_ID) == user_point_id(f" {REPO_ID} ")
+    assert repository_point_id(REPO_ID) != user_point_id(REPO_ID)
+    assert repository_point_id(REPO_ID) != repository_point_id(OTHER_REPO_ID)
 
 
-@pytest.mark.parametrize("value", ["", "   "])
+def test_backend_ids_are_canonical_valid_uuids():
+    uppercase_uuid = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"
+    assert canonical_backend_uuid(uppercase_uuid, field_name="repo_id") == uppercase_uuid.lower()
+    with pytest.raises(ValueError, match="backend-issued UUID"):
+        canonical_backend_uuid("owner/repository", field_name="repo_id")
+
+
+@pytest.mark.parametrize("value", ["", "   ", "repo-123", "owner/repository"])
 def test_point_ids_reject_empty_identifiers(value):
     with pytest.raises(ValueError):
         repository_point_id(value)
@@ -62,16 +73,21 @@ def test_point_ids_reject_non_string_identifiers():
 
 
 def test_store_uses_the_published_repository_point_id_helper():
-    assert QdrantRepositoryStore._point_id("repo-123") == repository_point_id("repo-123")
+    assert QdrantRepositoryStore._point_id(REPO_ID) == repository_point_id(REPO_ID)
 
 
 def test_repository_payload_contract_has_identity_and_embedding_fields():
     assert tuple(REPOSITORY_PAYLOAD_FIELD_TYPES) == REPOSITORY_PAYLOAD_REQUIRED_FIELDS
     assert {"repo_id", "full_name"}.issubset(REPOSITORY_PAYLOAD_REQUIRED_FIELDS)
     assert {
+        "github_id",
+        "content_version",
+        "content_hash",
         "embedding_dim",
         "embedding_model",
         "embedding_version",
+        "model_version",
+        "indexed_at",
         "source_hash",
     }.issubset(REPOSITORY_PAYLOAD_REQUIRED_FIELDS)
 
@@ -97,7 +113,7 @@ def test_current_payload_builder_publishes_the_frozen_contract():
             "topics": ["machine-learning"],
             "extracted_paragraphs": ["A documented project."],
         },
-        repo_id="repo-123",
+        repo_id=REPO_ID,
         final_embedding=[0.0] * 384,
         readme_chunks=1,
         source_hash="source-hash",

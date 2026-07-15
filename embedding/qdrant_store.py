@@ -20,6 +20,7 @@ from config import (
 from .repository_embedding import RepositoryEmbeddingResult
 from .vector_contract import (
     REPOSITORY_DISCOVERY_CHANNELS,
+    canonical_backend_uuid,
     repository_point_id,
     validate_embedding_vector,
     validate_repository_payload,
@@ -370,10 +371,7 @@ class QdrantRepositoryStore:
         canonical: list[str] = []
         seen: set[str] = set()
         for repo_id in repo_ids:
-            # repository_point_id performs the public contract's type and
-            # emptiness checks; stripping here keeps the returned order stable.
-            repository_point_id(repo_id)
-            normalized = repo_id.strip()
+            normalized = canonical_backend_uuid(repo_id, field_name="repo_id")
             if normalized not in seen:
                 seen.add(normalized)
                 canonical.append(normalized)

@@ -1,8 +1,8 @@
 """Stable identifiers and data contracts for the vector platform.
 
-This module is the shared boundary published by Person 2.  Downstream code
-should treat repository and user identifiers as opaque strings and use the
-helpers here whenever it needs the corresponding Qdrant point ID.
+This module is the shared boundary published by Person 2. Downstream code
+must pass backend-issued UUIDs and use the helpers here whenever it needs the
+corresponding Qdrant point ID.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import math
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from numbers import Real
 from types import MappingProxyType
 from typing import Any
@@ -78,35 +78,41 @@ def _canonical_identifier(value: str, *, field_name: str) -> str:
     return canonical
 
 
+def canonical_backend_uuid(value: str, *, field_name: str) -> str:
+    """Validate and canonicalize a backend-issued UUID identifier."""
+    canonical = _canonical_identifier(value, field_name=field_name)
+    try:
+        parsed = uuid.UUID(canonical)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be a valid backend-issued UUID") from exc
+    return str(parsed)
+
+
 def repository_point_id(repo_id: str) -> str:
-    """Return the deterministic Qdrant point ID for an opaque repository ID."""
-    canonical = _canonical_identifier(repo_id, field_name="repo_id")
+    """Return the deterministic Qdrant point ID for a backend repository UUID."""
+    canonical = canonical_backend_uuid(repo_id, field_name="repo_id")
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"github:{canonical}"))
 
 
 def user_point_id(user_id: str) -> str:
-    """Return the deterministic Qdrant point ID for an opaque user ID."""
-    canonical = _canonical_identifier(user_id, field_name="user_id")
+    """Return the deterministic Qdrant point ID for a backend user UUID."""
+    canonical = canonical_backend_uuid(user_id, field_name="user_id")
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"user:{canonical}"))
 
 
 def resolve_repository_identity(repo: Mapping[str, Any]) -> tuple[str, str]:
     """Return the canonical ``(repo_id, full_name)`` for a repository input.
 
-    ``repo_id`` is opaque: consumers must not assume it is a GitHub name or a
-    UUID.  Legacy acquisition payloads used ``id=owner/repository``; that shape
-    remains readable while all emitted payloads publish both fields explicitly.
+    ``repo_id`` must be the UUID issued by the backend ingestion API. Names,
+    URLs, GitHub handles, and ``full_name`` are attributes only.
     """
     if not isinstance(repo, Mapping):
         raise TypeError("repository payload must be a mapping")
 
     raw_repo_id = repo.get("repo_id") or repo.get("id")
-    repo_id = _canonical_identifier(raw_repo_id, field_name="repo_id")
+    repo_id = canonical_backend_uuid(raw_repo_id, field_name="repo_id")
 
     raw_full_name = repo.get("full_name")
-    legacy_id = repo.get("id")
-    if raw_full_name is None and isinstance(legacy_id, str) and "/" in legacy_id:
-        raw_full_name = legacy_id
     full_name = _canonical_identifier(raw_full_name, field_name="full_name")
 
     owner, separator, name = full_name.partition("/")
@@ -145,6 +151,7 @@ def validate_embedding_vector(
 REPOSITORY_PAYLOAD_FIELD_TYPES: Mapping[str, type | tuple[type, ...]] = MappingProxyType(
     {
         "repo_id": str,
+        "github_id": (str, type(None)),
         "full_name": str,
         "html_url": (str, type(None)),
         "description": str,
@@ -175,6 +182,10 @@ REPOSITORY_PAYLOAD_FIELD_TYPES: Mapping[str, type | tuple[type, ...]] = MappingP
         "embedding_dim": int,
         "embedding_model": str,
         "embedding_version": str,
+        "content_version": int,
+        "content_hash": str,
+        "model_version": str,
+        "indexed_at": str,
         "source_hash": str,
     }
 )
@@ -193,6 +204,7 @@ _INTEGER_FIELDS = {
     "delta_3d",
     "delta_7d",
     "delta_30d",
+    "content_version",
 }
 _NON_NEGATIVE_INTEGER_FIELDS = _INTEGER_FIELDS - {"delta_3d", "delta_7d", "delta_30d"}
 _FINITE_NUMBER_FIELDS = {
@@ -201,7 +213,7 @@ _FINITE_NUMBER_FIELDS = {
     "activity_score",
     "trend_velocity",
 }
-_TIMESTAMP_FIELDS = {"created_at", "updated_at", "pushed_at"}
+_TIMESTAMP_FIELDS = {"created_at", "updated_at", "pushed_at", "indexed_at"}
 _STRING_LIST_FIELDS = {"languages", "topics", "tags"}
 
 
@@ -223,6 +235,10 @@ def validate_repository_payload(payload: Mapping[str, Any]) -> None:
             )
 
     resolve_repository_identity(payload)
+
+    github_id = payload["github_id"]
+    if github_id is not None and (not github_id or not github_id.isdecimal()):
+        raise ValueError("repository payload field 'github_id' must be a decimal string")
 
     for field_name in _INTEGER_FIELDS:
         value = payload[field_name]
@@ -251,16 +267,24 @@ def validate_repository_payload(payload: Mapping[str, Any]) -> None:
         raise ValueError(
             "repository payload embedding_dim does not match the collection contract"
         )
-    for field_name in ("embedding_model", "embedding_version", "source_hash"):
+    for field_name in (
+        "embedding_model",
+        "embedding_version",
+        "content_hash",
+        "model_version",
+        "source_hash",
+    ):
         if not payload[field_name].strip():
             raise ValueError(f"repository payload field {field_name!r} must be non-empty")
 
 
 def _parse_iso_timestamp(value: str, *, field_name: str) -> None:
     try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as exc:
         raise ValueError(f"{field_name} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise ValueError(f"{field_name} must be an ISO-8601 UTC timestamp")
 
 
 def _type_label(expected_type: type | tuple[type, ...]) -> str:
@@ -273,6 +297,7 @@ def repository_payload_defaults() -> dict[str, object]:
     """Return fresh defaults for optional repository metadata fields."""
     return {
         "html_url": None,
+        "github_id": None,
         "description": "",
         "primary_language": "Unknown",
         "languages": [],
@@ -301,4 +326,6 @@ def repository_payload_defaults() -> dict[str, object]:
         "embedding_dim": REPOSITORY_EMBEDDING_DIM,
         "embedding_model": REPOSITORY_EMBEDDING_MODEL,
         "embedding_version": REPOSITORY_EMBEDDING_VERSION,
+        "content_version": 0,
+        "model_version": REPOSITORY_EMBEDDING_MODEL,
     }

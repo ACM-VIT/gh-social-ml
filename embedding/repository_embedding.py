@@ -7,7 +7,7 @@ import json
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import datetime, timedelta, timezone
 from numbers import Integral, Real
 from typing import Any
 
@@ -233,6 +233,7 @@ def build_vector_payload(
         {
             "repo_id": canonical_repo_id,
             "full_name": full_name,
+            "github_id": _optional_decimal_string_field(repo.get("github_id")),
             "description": _string_field(repo.get("description"), "description", default=""),
             "primary_language": _string_field(
                 repo.get("primary_language"), "primary_language", default="Unknown"
@@ -264,6 +265,9 @@ def build_vector_payload(
                 "mentionable_users_count",
                 default=0,
             ),
+            "content_version": _integer_field(
+                repo.get("content_version"), "content_version", default=0
+            ),
             "readme_to_codebase_ratio": _finite_number_field(
                 repo.get("readme_to_codebase_ratio"),
                 "readme_to_codebase_ratio",
@@ -278,12 +282,13 @@ def build_vector_payload(
     )
     # The below payload fields are for Qdrant filtering and inspection without
     # fetching the original repository object again.
-    tags = extract_tags(canonical_repo_id, normalized_repo["extracted_paragraphs"])
+    tags = extract_tags(full_name, normalized_repo["extracted_paragraphs"])
     category = classify_category(normalized_repo, tags)
     documentation = score_documentation(normalized_repo)
 
     payload = {
         "repo_id": canonical_repo_id,
+        "github_id": normalized_repo["github_id"],
         "full_name": full_name,
         "html_url": _optional_string_field(repo.get("html_url"), "html_url"),
         "description": normalized_repo["description"],
@@ -324,6 +329,14 @@ def build_vector_payload(
         "embedding_dim": len(validated_embedding),
         "embedding_model": config.model_name,
         "embedding_version": config.version,
+        "content_version": normalized_repo["content_version"],
+        "content_hash": _string_field(
+            repo.get("content_hash") or source_hash, "content_hash"
+        ),
+        "model_version": _string_field(
+            repo.get("model_version") or config.model_name, "model_version"
+        ),
+        "indexed_at": datetime.now(timezone.utc).isoformat(),
         "source_hash": _string_field(source_hash, "source_hash"),
     }
     validate_repository_payload(payload)
@@ -349,6 +362,17 @@ def _optional_string_field(value: Any, field_name: str) -> str | None:
     if not isinstance(value, str):
         raise TypeError(f"{field_name} must be a string or None")
     return value.strip() or None
+
+
+def _optional_decimal_string_field(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise TypeError("github_id must be a decimal string or None")
+    normalized = value.strip()
+    if not normalized.isdecimal():
+        raise ValueError("github_id must be a decimal string")
+    return normalized
 
 
 def _integer_field(
@@ -394,16 +418,20 @@ def _timestamp_field(value: Any, field_name: str) -> str | None:
     if value is None or value == "":
         return None
     if isinstance(value, datetime):
-        return value.isoformat()
-    if isinstance(value, date):
-        return value.isoformat()
+        parsed = value
+        normalized = value.isoformat()
+        if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+            raise ValueError(f"{field_name} must be an ISO-8601 UTC timestamp")
+        return normalized
     if not isinstance(value, str):
-        raise TypeError(f"{field_name} must be an ISO-8601 string, date, or None")
+        raise TypeError(f"{field_name} must be an ISO-8601 UTC string or None")
     normalized = value.strip()
     try:
-        datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
     except ValueError as exc:
         raise ValueError(f"{field_name} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise ValueError(f"{field_name} must be an ISO-8601 UTC timestamp")
     return normalized
 
 
