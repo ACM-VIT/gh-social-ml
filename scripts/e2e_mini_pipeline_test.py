@@ -223,20 +223,7 @@ def step_retrieve(kept: list, db, qdrant_ok: bool = True):
 
     engine = RetrievalEngine()
 
-    # Invalidate any cached batch so we get a fresh result
-    if db and db.enabled:
-        conn = None
-        try:
-            conn = db.connect()
-            cur  = conn.cursor()
-            cur.execute("DELETE FROM user_recommendation_batches WHERE user_id = %s;", (TARGET_USER,))
-            conn.commit()
-        except Exception:
-            if conn:
-                conn.rollback()
-        finally:
-            if conn:
-                conn.close()
+    # Backend Redis owns feed cache invalidation; always generate a fresh ML result here.
 
     batches = engine.fetch_onboarding_batches(TARGET_USER)
     return batches

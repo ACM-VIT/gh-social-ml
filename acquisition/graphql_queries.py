@@ -11,6 +11,8 @@ query SearchRepositories($query: String!, $after: String) {
     }
     nodes {
       ... on Repository {
+        id
+        databaseId
         nameWithOwner
         name
         owner { login }
@@ -40,6 +42,8 @@ def build_batch_metadata_query(repos: list[tuple[str, str]]) -> str:
         escaped_name = name.replace('\\', '\\\\').replace('"', '\\"')
         parts.append(f"""
   {alias}: repository(owner: "{escaped_owner}", name: "{escaped_name}") {{
+    id
+    databaseId
     nameWithOwner
     name
     description
@@ -92,6 +96,7 @@ GET_REPOSITORY_QUERY = """
 query GetRepository($owner: String!, $name: String!) {
   repository(owner: $owner, name: $name) {
     id
+    databaseId
     name
     nameWithOwner
     description
@@ -193,5 +198,4 @@ query GetRepository($owner: String!, $name: String!) {
   }
 }
 """
-
 

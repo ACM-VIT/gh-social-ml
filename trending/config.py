@@ -22,6 +22,11 @@ TRENDING_REFRESH_HOURS: int = 24  # Default, will be validated and cast in valid
 TRENDING_TABLE_NAME: str = os.getenv("TRENDING_TABLE_NAME", "trending_repositories")
 TRENDING_METADATA_TABLE_NAME: str = os.getenv("TRENDING_METADATA_TABLE_NAME", "trending_metadata")
 
+# Payload synchronization is opt-in so the Postgres trending refresh can still
+# run in deployments that do not provide Qdrant to this offline service.
+TRENDING_QDRANT_SYNC_STR: str = os.getenv("TRENDING_QDRANT_SYNC_ENABLED", "false")
+TRENDING_QDRANT_SYNC_ENABLED: bool = False
+
 
 # ── GitHub API Configuration ───────────────────────────────────────────────────────
 
@@ -45,6 +50,8 @@ README_MAX_LENGTH: int = 10000  # Default, will be validated and cast in validat
 
 # PostgreSQL database URL (shared with main application)
 DATABASE_URL: str | None = os.getenv("DATABASE_URL")
+BACKEND_URL: str | None = os.getenv("BACKEND_URL")
+INTERNAL_API_SECRET: str | None = os.getenv("INTERNAL_API_SECRET")
 
 # Connection pool size for database operations
 DB_POOL_SIZE_STR: str = os.getenv("DB_POOL_SIZE", "5")
@@ -85,8 +92,18 @@ def validate_config() -> list[str]:
     """
     global TRENDING_REPO_LIMIT, TRENDING_REFRESH_HOURS, GITHUB_TIMEOUT_SECONDS
     global GITHUB_MAX_RETRIES, README_MAX_LENGTH, DB_POOL_SIZE, MAX_CONSECUTIVE_FAILURES
+    global TRENDING_QDRANT_SYNC_ENABLED
     
     errors: list[str] = []
+
+    normalized_sync = str(TRENDING_QDRANT_SYNC_STR).strip().lower()
+    if normalized_sync not in {"true", "false"}:
+        errors.append(
+            "TRENDING_QDRANT_SYNC_ENABLED must be 'true' or 'false', "
+            f"got {TRENDING_QDRANT_SYNC_STR!r}"
+        )
+    else:
+        TRENDING_QDRANT_SYNC_ENABLED = normalized_sync == "true"
 
     # Cast and validate TRENDING_REPO_LIMIT
     try:
@@ -150,8 +167,5 @@ def validate_config() -> list[str]:
         errors.append(f"TRENDING_TABLE_NAME must match pattern {table_name_pattern}, got '{TRENDING_TABLE_NAME}'")
     if not re.match(table_name_pattern, TRENDING_METADATA_TABLE_NAME):
         errors.append(f"TRENDING_METADATA_TABLE_NAME must match pattern {table_name_pattern}, got '{TRENDING_METADATA_TABLE_NAME}'")
-
-    if not DATABASE_URL:
-        errors.append("DATABASE_URL is not set. Database integration will be disabled.")
 
     return errors

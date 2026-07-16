@@ -9,6 +9,7 @@ Connection is configured via DATABASE_URL environment variable:
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import json
 import logging
 import os
@@ -17,6 +18,8 @@ import re
 import uuid
 from urllib.parse import urlparse, parse_qs
 from typing import Any
+
+from acquisition.identity import normalize_repository_name, repository_identity_key
 
 try:
     import pg8000.dbapi
@@ -30,6 +33,18 @@ logger = logging.getLogger("pipeline.database")
 _SUPABASE_HOST_RE = re.compile(
     r"\.supabase\.(co|com|in|io)$|supabase\.co$|pooler\.supabase\.com$", re.I
 )
+
+
+@dataclass(slots=True)
+class RepositoryUpsertResult:
+    """Exact per-repository outcome for a corpus persistence batch."""
+
+    succeeded: list[str] = field(default_factory=list)
+    failed: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def count(self) -> int:
+        return len(self.succeeded)
 
 
 class PostgreSQLConnector:
@@ -332,17 +347,27 @@ class PostgreSQLConnector:
 
         Returns the number of successfully upserted repositories.
         """
+        return self.upsert_repositories_detailed(results).count
+
+    def upsert_repositories_detailed(self, results: list[Any]) -> RepositoryUpsertResult:
+        """Upsert repositories and return the exact successful and failed identities."""
+        outcome = RepositoryUpsertResult()
         if not self.enabled:
             logger.warning("Database integration disabled; skipping upsert.")
-            return 0
+            outcome.failed.update(
+                {
+                    str(getattr(result, "repo_id", "unknown/repository")): "database integration disabled"
+                    for result in results
+                }
+            )
+            return outcome
 
         if not results:
             logger.info("No repositories to save.")
-            return 0
+            return outcome
 
-        logger.info(f"Upserting {len(results)} repositories into PostgreSQL...")
+        logger.info("Upserting %d repositories into PostgreSQL...", len(results))
         conn = None
-        upserted_count = 0
         try:
             conn = self.connect()
             cursor = conn.cursor()
@@ -375,70 +400,31 @@ class PostgreSQLConnector:
             """
 
             for r in results:
-                p = r.payload
-                raw = r.raw_repository
-
-                # ── Map enrichment fields to DB columns ───────────────────────
-                github_repo_url = p.get("html_url") or f"https://github.com/{r.repo_id}"
-                owner_id = (raw.get("owner") or {}).get("login") or r.repo_id.partition("/")[0]
-                repo_name = raw.get("name") or r.repo_id.partition("/")[2]
-                full_name = r.repo_id
-                description = (p.get("description") or "")[:2000]  # cap for safety
-
-                primary_language = p.get("primary_language") or raw.get("language") or "Unknown"
-                special_label = p.get("special_label")
-
-                # Languages as JSONB — store full {lang: bytes} mapping
-                languages_json = json.dumps(r.languages or {})
-                topics_json = json.dumps(r.topics or [])
-
-                # Limit readme clean text to first 5000 chars for readme_summary
-                readme_text = getattr(r.readme, "clean_text", "") or ""
-                readme_summary = readme_text[:5000]
-
-                readme_md = getattr(r.readme, "readme_md", "") or ""
-
-                star_count = int(p.get("star_count") or 0)
-                forks_count = int(p.get("fork_count") or 0)
-                pr_count = int(raw.get("pull_requests_count") or 0)
-
-                # Generate a UUIDv4 in Python to ensure compatibility across all PG environments,
-                # even if the pgcrypto extension is missing or unprivileged.
-                repo_uuid = str(uuid.uuid4())
-
-                params = (
-                    repo_uuid,
-                    github_repo_url,
-                    owner_id,
-                    repo_name,
-                    full_name,
-                    description,
-                    primary_language,
-                    special_label,
-                    languages_json,
-                    topics_json,
-                    readme_summary,
-                    readme_md,
-                    star_count,
-                    forks_count,
-                    pr_count,
-                )
-
+                identity = normalize_repository_name(getattr(r, "repo_id", ""))
+                identity = identity or str(getattr(r, "repo_id", "unknown/repository"))
+                savepoint_created = False
                 try:
                     cursor.execute("SAVEPOINT row_upsert;")
+                    savepoint_created = True
+                    full_name, params = self._build_upsert_params(cursor, r)
                     cursor.execute(upsert_query, params)
                     cursor.execute("RELEASE SAVEPOINT row_upsert;")
-                    upserted_count += 1
+                    outcome.succeeded.append(full_name)
                 except Exception as row_exc:
-                    logger.error(f"Failed to upsert repo {full_name}: {row_exc}")
-                    try:
-                        cursor.execute("ROLLBACK TO SAVEPOINT row_upsert;")
-                    except Exception as rb_exc:
-                        logger.error(f"Failed to rollback to savepoint: {rb_exc}")
+                    logger.error("Failed to upsert repo %s: %s", identity, row_exc)
+                    outcome.failed[identity] = str(row_exc)[:500]
+                    if savepoint_created:
+                        try:
+                            cursor.execute("ROLLBACK TO SAVEPOINT row_upsert;")
+                            cursor.execute("RELEASE SAVEPOINT row_upsert;")
+                        except Exception as rb_exc:
+                            logger.error("Failed to rollback to savepoint: %s", rb_exc)
 
             conn.commit()
             logger.info(
-                f"Database upsert complete. {upserted_count}/{len(results)} rows successfully upserted."
+                "Database upsert complete. %d/%d rows successfully upserted.",
+                outcome.count,
+                len(results),
             )
         except Exception as exc:
             logger.error(f"Database transaction failed: {exc}")
@@ -449,7 +435,59 @@ class PostgreSQLConnector:
             if conn:
                 conn.close()
 
-        return upserted_count
+        return outcome
+
+    @staticmethod
+    def _build_upsert_params(cursor: Any, result: Any) -> tuple[str, tuple[Any, ...]]:
+        """Validate and map one enrichment result inside its row savepoint."""
+        payload = result.payload
+        raw = result.raw_repository
+        full_name = normalize_repository_name(result.repo_id)
+        if not full_name:
+            raise ValueError("invalid repository identity")
+
+        github_repo_url = payload.get("html_url") or f"https://github.com/{full_name}"
+        owner_id = (raw.get("owner") or {}).get("login") or full_name.partition("/")[0]
+        repo_name = raw.get("name") or full_name.partition("/")[2]
+        description = str(payload.get("description") or "")[:2000]
+        primary_language = (
+            payload.get("primary_language") or raw.get("language") or "Unknown"
+        )
+        languages_json = json.dumps(result.languages or {})
+        topics_json = json.dumps(result.topics or [])
+        readme_text = getattr(result.readme, "clean_text", "") or ""
+        readme_md = getattr(result.readme, "readme_md", "") or ""
+
+        repo_uuid = str(
+            uuid.uuid5(uuid.NAMESPACE_URL, f"github:{full_name.casefold()}")
+        )
+        cursor.execute(
+            "SELECT repo_id, github_repo_url FROM Repo "
+            "WHERE LOWER(full_name) = %s LIMIT 1;",
+            (repository_identity_key(full_name),),
+        )
+        existing_identity = cursor.fetchone()
+        if isinstance(existing_identity, (tuple, list)) and len(existing_identity) >= 2:
+            repo_uuid = str(existing_identity[0])
+            github_repo_url = str(existing_identity[1])
+
+        return full_name, (
+            repo_uuid,
+            github_repo_url,
+            owner_id,
+            repo_name,
+            full_name,
+            description,
+            primary_language,
+            payload.get("special_label"),
+            languages_json,
+            topics_json,
+            readme_text[:5000],
+            readme_md,
+            int(payload.get("star_count") or 0),
+            int(payload.get("fork_count") or 0),
+            int(raw.get("pull_requests_count") or 0),
+        )
 
     # ── Query Helpers ─────────────────────────────────────────────────────────
 
@@ -462,6 +500,83 @@ class PostgreSQLConnector:
             cursor = conn.cursor()
             cursor.execute("SELECT COUNT(*) FROM Repo;")
             return cursor.fetchone()[0]
+        finally:
+            conn.close()
+
+    def get_existing_repository_names(self) -> set[str]:
+        """Return all persisted repository names for pre-enrichment deduplication."""
+        if not self.enabled:
+            return set()
+        conn = self.connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT full_name FROM Repo WHERE full_name IS NOT NULL;")
+            return {
+                normalized
+                for row in cursor.fetchall()
+                if row and (normalized := normalize_repository_name(row[0]))
+            }
+        finally:
+            conn.close()
+
+    def get_repositories_by_full_names(self, full_names: list[str]) -> list[dict[str, Any]]:
+        """Rebuild embedding-compatible payloads for persisted indexing retries."""
+        if not self.enabled or not full_names:
+            return []
+        normalized = [name for value in full_names if (name := normalize_repository_name(value))]
+        if not normalized:
+            return []
+        conn = self.connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT full_name, github_repo_url, description, primary_language,
+                       language_used, topics, readme_summary, readme_md,
+                       star_count, forks_count, pr_count, updated_at
+                FROM Repo
+                WHERE LOWER(full_name) IN (%s);
+                """ % ", ".join(["%s"] * len(normalized)),
+                tuple(repository_identity_key(name) for name in normalized),
+            )
+            rows = cursor.fetchall()
+            payloads: list[dict[str, Any]] = []
+            for row in rows:
+                (
+                    full_name,
+                    github_repo_url,
+                    description,
+                    primary_language,
+                    language_used,
+                    topics,
+                    readme_summary,
+                    readme_md,
+                    star_count,
+                    forks_count,
+                    pr_count,
+                    updated_at,
+                ) = row
+                languages = json.loads(language_used) if isinstance(language_used, str) else (language_used or {})
+                parsed_topics = json.loads(topics) if isinstance(topics, str) else (topics or [])
+                readme_text = readme_summary or readme_md or ""
+                payloads.append(
+                    {
+                        "id": full_name,
+                        "full_name": full_name,
+                        "html_url": github_repo_url,
+                        "description": description or "",
+                        "primary_language": primary_language or "Unknown",
+                        "languages": list(languages) if isinstance(languages, dict) else list(languages),
+                        "topics": list(parsed_topics),
+                        "extracted_paragraphs": [readme_text] if readme_text else [],
+                        "readme_length": len(readme_text),
+                        "star_count": int(star_count or 0),
+                        "fork_count": int(forks_count or 0),
+                        "pr_count": int(pr_count or 0),
+                        "updated_at": updated_at.isoformat() if hasattr(updated_at, "isoformat") else updated_at,
+                    }
+                )
+            return payloads
         finally:
             conn.close()
 

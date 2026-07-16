@@ -11,7 +11,7 @@ import signal
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Any
 
 try:
     import schedule
@@ -37,7 +37,7 @@ class TrendingScheduler:
     def __init__(
         self,
         fetcher: TrendingFetcher | None = None,
-        storage: TrendingStorage | None = None,
+        storage: Any | None = None,
     ) -> None:
         """Initialize the trending scheduler.
 
@@ -222,7 +222,7 @@ class TrendingScheduler:
         self.scheduler.clear()
 
 
-def run_scheduler() -> None:
+def run_scheduler(*, storage: Any | None = None) -> None:
     """Entry point for running the trending scheduler.
 
     This function starts the scheduled refresh cycle and blocks until
@@ -231,14 +231,14 @@ def run_scheduler() -> None:
     logger.info("Initializing trending scheduler...")
 
     try:
-        scheduler = TrendingScheduler()
+        scheduler = TrendingScheduler(storage=storage)
         scheduler.start_scheduled()
     except Exception as exc:
         logger.error(f"Failed to start trending scheduler: {exc}", exc_info=True)
         raise
 
 
-def run_once(force: bool = False) -> bool:
+def run_once(force: bool = False, *, storage: Any | None = None) -> bool:
     """Entry point for running a single refresh cycle.
 
     Args:
@@ -250,7 +250,7 @@ def run_once(force: bool = False) -> bool:
     logger.info("Initializing single refresh cycle...")
 
     try:
-        scheduler = TrendingScheduler()
+        scheduler = TrendingScheduler(storage=storage)
         return scheduler.start_once(force=force)
     except Exception as exc:
         logger.error(f"Failed to run single refresh cycle: {exc}", exc_info=True)

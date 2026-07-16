@@ -64,34 +64,8 @@ def _onboard_mock_users() -> None:
 
 
 def _invalidate_cache(user_id: str, engine) -> None:
-    """Delete any existing cached batches for user_id from Postgres."""
-    db = engine.db
-    if db is None or not db.enabled:
-        return
-    conn = None
-    try:
-        conn = db.connect()
-        cursor = conn.cursor()
-        engine._ensure_recommendations_table(conn)
-        cursor.execute(
-            "DELETE FROM user_recommendation_batches WHERE user_id = %s;",
-            (user_id,),
-        )
-        conn.commit()
-        logger.info("Cache invalidated for '%s'.", user_id)
-    except Exception as exc:
-        logger.warning("Cache invalidation failed for '%s': %s", user_id, exc)
-        if conn:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-    finally:
-        if conn:
-            try:
-                conn.close()
-            except Exception:
-                pass
+    """No-op: backend Redis now owns feed cache invalidation."""
+    logger.info("Skipping local cache invalidation for '%s'; backend Redis owns feed cache.", user_id)
 
 
 def _print_batch(

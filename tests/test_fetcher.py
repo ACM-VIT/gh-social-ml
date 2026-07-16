@@ -393,12 +393,8 @@ class TestFetchTrendingRepositories:
             },
         ]
         
-        monkeypatch.setenv("CONTINUE_ON_ERROR", "true")
-        import importlib
         import trending.config
-        import trending.fetcher
-        importlib.reload(trending.config)
-        importlib.reload(trending.fetcher)
+        monkeypatch.setattr(trending.config, "CONTINUE_ON_ERROR", True)
         
         fetcher = TrendingFetcher()
         with patch.object(fetcher, '_normalize_repository', side_effect=mock_normalize):
@@ -435,13 +431,9 @@ class TestFetchTrendingRepositories:
             for i in range(10)
         ]
         
-        monkeypatch.setenv("CONTINUE_ON_ERROR", "true")
-        monkeypatch.setenv("MAX_CONSECUTIVE_FAILURES", "3")
-        import importlib
         import trending.config
-        import trending.fetcher
-        importlib.reload(trending.config)
-        importlib.reload(trending.fetcher)
+        monkeypatch.setattr(trending.config, "CONTINUE_ON_ERROR", True)
+        monkeypatch.setattr(trending.config, "MAX_CONSECUTIVE_FAILURES", 3)
         
         fetcher = TrendingFetcher()
         with patch.object(fetcher, '_normalize_repository', side_effect=mock_normalize):

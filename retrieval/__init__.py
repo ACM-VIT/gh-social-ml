@@ -1,12 +1,9 @@
-"""Candidate retrieval package for gh-social-ml.
-
-Provides multi-channel L1 candidate retrieval using Qdrant semantic search
-and PostgreSQL metadata queries.
-"""
+"""Qdrant-only candidate retrieval package for gh-social-ml."""
 
 from .candidate_retriever import CandidateRetriever
 from .config import (
     SEMANTIC_LIMIT,
+    DISCOVERY_LIMIT,
     TRENDING_LIMIT,
     TOTAL_CANDIDATE_POOL,
     QDRANT_COLLECTION_NAME,
@@ -17,6 +14,7 @@ from .config import (
 __all__ = [
     "CandidateRetriever",
     "SEMANTIC_LIMIT",
+    "DISCOVERY_LIMIT",
     "TRENDING_LIMIT",
     "TOTAL_CANDIDATE_POOL",
     "QDRANT_COLLECTION_NAME",

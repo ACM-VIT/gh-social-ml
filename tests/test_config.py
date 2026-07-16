@@ -111,21 +111,13 @@ class TestConfigValidation:
 
     def test_validate_config_with_valid_config(self, monkeypatch):
         """Test validation with valid configuration."""
-        monkeypatch.setenv("DATABASE_URL", "postgresql://test:test@localhost:5432/test")
+        monkeypatch.setenv("BACKEND_URL", "http://backend.test")
+        monkeypatch.setenv("INTERNAL_API_SECRET", "test-secret")
         import importlib
         import trending.config
         importlib.reload(trending.config)
         errors = trending.config.validate_config()
         assert errors == []
-
-    def test_validate_config_missing_database_url(self, monkeypatch):
-        """Test validation fails when DATABASE_URL is missing."""
-        monkeypatch.delenv("DATABASE_URL", raising=False)
-        import importlib
-        import trending.config
-        importlib.reload(trending.config)
-        errors = trending.config.validate_config()
-        assert any("DATABASE_URL" in error for error in errors)
 
     def test_validate_config_invalid_repo_limit(self, monkeypatch):
         """Test validation fails when TRENDING_REPO_LIMIT is invalid."""
@@ -147,8 +139,8 @@ class TestConfigValidation:
 
     def test_validate_config_multiple_errors(self, monkeypatch):
         """Test validation returns multiple errors."""
-        monkeypatch.delenv("DATABASE_URL", raising=False)
         monkeypatch.setenv("TRENDING_REPO_LIMIT", "-5")
+        monkeypatch.setenv("TRENDING_REFRESH_HOURS", "-1")
         import importlib
         import trending.config
         importlib.reload(trending.config)

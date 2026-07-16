@@ -183,10 +183,6 @@ class RetrievalEngine:
         import time
 
         # ── 1. Check cache ────────────────────────────────────────────────────
-        cached = self._load_cached_batches(user_id)
-        if cached is not None:
-            logger.info("Returning cached recommendation batches for '%s'.", user_id)
-            return cached
 
         # ── 2. Get user profile from Qdrant ───────────────────────────────────
         try:

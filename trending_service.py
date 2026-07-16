@@ -32,7 +32,7 @@ from trending.config import validate_config, TRENDING_REPO_LIMIT_STR, TRENDING_R
 from trending.logger import setup_logger
 
 
-def parse_args():
+def parse_args(argv: list[str] | None = None):
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
         description="GitHub Trending Repository Ingestion Service",
@@ -92,12 +92,12 @@ Examples:
         help="Validate configuration and exit without running",
     )
 
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main():
+def main(argv: list[str] | None = None):
     """Main entry point for the trending service."""
-    args = parse_args()
+    args = parse_args(argv)
 
     # Setup logging
     logger = setup_logger(
@@ -129,6 +129,14 @@ def main():
         sys.exit(1)
 
     if args.validate_config:
+        missing = [
+            name for name in ("GITHUB_TOKEN", "BACKEND_URL", "INTERNAL_API_SECRET")
+            if not os.getenv(name)
+        ]
+        if missing:
+            for name in missing:
+                logger.error("  - %s is required", name)
+            sys.exit(1)
         logger.info("Configuration validation passed.")
         sys.exit(0)
 
@@ -139,12 +147,23 @@ def main():
 
     # Run in requested mode
     try:
+        from acquisition.backend_client import BackendIngestionClient
+        from trending.backend_storage import BackendTrendingStorage
+
+        backend = BackendIngestionClient(
+            base_url=os.environ["BACKEND_URL"],
+            internal_secret=os.environ["INTERNAL_API_SECRET"],
+        )
+        storage = BackendTrendingStorage(
+            backend=backend,
+            github_token=os.environ["GITHUB_TOKEN"],
+        )
         if args.scheduled:
             logger.info("Starting scheduled mode...")
-            run_scheduler()
+            run_scheduler(storage=storage)
         elif args.once:
             logger.info("Starting single refresh cycle...")
-            success = run_once(force=True)
+            success = run_once(force=True, storage=storage)
             if success:
                 logger.info("Single refresh cycle completed successfully.")
                 sys.exit(0)

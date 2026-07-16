@@ -1,4 +1,5 @@
 __pycache__/
+.cache/
 *.py[cod]
 *$py.class
 .pytest_cache/
@@ -21,4 +22,3 @@ monitoring/
 
 # Output verification files
 open_multi_agent_readme.md
-

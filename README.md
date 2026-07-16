@@ -24,6 +24,7 @@
 - [About](#about)
 - [Quick Start](#quick-start)
 - [Usage](#usage)
+- [Offline ML Pipelines](#offline-ml-pipelines)
 - [Contributing](#contributing)
 - [Hacktoberfest](#hacktoberfest)
 - [Submitting a Pull Request](#submitting-a-pull-request)
@@ -65,6 +66,14 @@ Provide examples and code snippets showing how to use the project. Add screensho
 <your-cli> init
 <your-cli> run
 ```
+
+## Offline ML Pipelines
+
+Repository acquisition and trending synchronization are offline worker jobs,
+not request-path services. See the
+[offline pipeline operations runbook](docs/OFFLINE_PIPELINE_RUNBOOK.md) for
+configuration validation, bounded runs, safe shutdown, checkpoint resume, and
+diagnosis.
 
 ---
 
