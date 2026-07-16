@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 from config import QDRANT_API_KEY, QDRANT_URL, REPOSITORY_EMBEDDING_MODEL
@@ -24,6 +25,43 @@ EMBEDDING_MODEL = REPOSITORY_EMBEDDING_MODEL
 VECTOR_DIMENSION = USER_PROFILE_COLLECTION_CONTRACT.vector_size
 USER_PROFILES_COLLECTION = USER_PROFILE_COLLECTION_CONTRACT.collection_name
 TARGET_VECTOR_NAME = USER_PROFILE_COLLECTION_CONTRACT.vector_name
+
+_FEEDBACK_PAYLOAD_KEYS = {
+    "feedback_latent_vector",
+    "feedback_adjustments",
+    "feedback_applied_signals",
+    "feedback_processed_events",
+    "last_feedback_version",
+    "last_feedback_event_id",
+    "preference_accumulator",
+}
+
+
+def _stored_vector(point: Any) -> list[float]:
+    value = point.vector
+    if isinstance(value, Mapping):
+        if TARGET_VECTOR_NAME and TARGET_VECTOR_NAME in value:
+            value = value[TARGET_VECTOR_NAME]
+        elif len(value) == 1:
+            value = next(iter(value.values()))
+        else:
+            raise ValueError("stored user profile has ambiguous named vectors")
+    return validate_embedding_vector(
+        list(value), expected_size=VECTOR_DIMENSION, field_name="stored user embedding"
+    )
+
+
+def _has_feedback_state(payload: Mapping[str, Any]) -> bool:
+    try:
+        if int(payload.get("last_feedback_version") or 0) > 0:
+            return True
+    except (TypeError, ValueError) as exc:
+        raise ValueError("last_feedback_version must be a non-negative integer") from exc
+    return any(
+        key in payload
+        and key not in {"last_feedback_version", "preference_accumulator"}
+        for key in _FEEDBACK_PAYLOAD_KEYS
+    )
 
 
 def _string_values(value: Any) -> list[str]:
@@ -175,22 +213,52 @@ class UserOnboardingPipeline:
             user_payload["job_id"] = canonical_backend_uuid(
                 user_payload["job_id"], field_name="job_id"
             )
-        user_payload.update(
-            {
-                "user_id": canonical_user_id,
-                "embedding_dim": VECTOR_DIMENSION,
-                "embedding_model": self.model_name,
-                # Feedback uses this unnormalized state for reversible updates.
-                "preference_accumulator": list(normalized),
-            }
-        )
-
         active_store = self.store or QdrantUserProfileStore(
             url=qdrant_url or QDRANT_URL,
             api_key=qdrant_api_key or QDRANT_API_KEY,
         )
         active_store.ensure_collection()
-        active_store.upsert_user(canonical_user_id, normalized, payload=user_payload)
+        existing = (
+            active_store.retrieve_user(canonical_user_id)
+            if hasattr(active_store, "retrieve_user")
+            else None
+        )
+        existing_payload = copy.deepcopy(dict(existing.payload or {})) if existing else {}
+        existing_profile_version = int(existing_payload.get("profile_version") or 0)
+        requested_profile_version = int(user_payload.get("profile_version") or 0)
+        if requested_profile_version and requested_profile_version < existing_profile_version:
+            raise ValueError(
+                f"profile_version {requested_profile_version} is older than stored "
+                f"version {existing_profile_version}"
+            )
+
+        stored_vector = normalized
+        if existing and _has_feedback_state(existing_payload):
+            stored_vector = _stored_vector(existing)
+            for key in _FEEDBACK_PAYLOAD_KEYS:
+                if key in existing_payload:
+                    user_payload[key] = copy.deepcopy(existing_payload[key])
+            # Keep the new profile baseline for a deliberate future replay or
+            # reconciliation without replacing the live learned state.
+            user_payload["profile_baseline_vector"] = list(normalized)
+        else:
+            user_payload["preference_accumulator"] = list(normalized)
+            user_payload.setdefault("last_feedback_version", 0)
+
+        user_payload.update(
+            {
+                "user_id": canonical_user_id,
+                "embedding_dim": VECTOR_DIMENSION,
+                "embedding_model": self.model_name,
+            }
+        )
+        active_store.upsert_user(canonical_user_id, stored_vector, payload=user_payload)
+        if (
+            existing
+            and str(existing.id) != canonical_user_id
+            and hasattr(active_store, "delete_legacy_user")
+        ):
+            active_store.delete_legacy_user(canonical_user_id)
         return True
 
     def onboard_user(

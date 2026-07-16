@@ -12,6 +12,7 @@ from .vector_contract import (
     USER_PROFILE_COLLECTION_CONTRACT,
     canonical_backend_uuid,
     user_point_id,
+    user_point_ids,
     validate_embedding_vector,
 )
 
@@ -124,6 +125,27 @@ class QdrantUserProfileStore:
                     payload=user_payload,
                 )
             ],
+        )
+
+    def retrieve_user(self, user_id: str) -> Any | None:
+        """Read canonical or pre-v2 UUID5 state, preferring canonical state."""
+        canonical, legacy = user_point_ids(user_id)
+        points = self.client.retrieve(
+            collection_name=self.contract.collection_name,
+            ids=[canonical, legacy],
+            with_payload=True,
+            with_vectors=True,
+        )
+        by_id = {str(point.id): point for point in points}
+        return by_id.get(canonical) or by_id.get(legacy)
+
+    def delete_legacy_user(self, user_id: str) -> None:
+        """Delete the pre-v2 identity after a canonical upsert has succeeded."""
+        _, legacy = user_point_ids(user_id)
+        self.client.delete(
+            collection_name=self.contract.collection_name,
+            points_selector=[legacy],
+            wait=True,
         )
 
     def _collection_exists(self) -> bool:

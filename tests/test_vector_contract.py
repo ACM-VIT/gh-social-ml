@@ -1,5 +1,7 @@
 """Phase 1 tests for the vector-platform contract."""
 
+import uuid
+
 import pytest
 
 from config import (
@@ -18,6 +20,8 @@ from embedding.vector_contract import (
     REPOSITORY_PAYLOAD_REQUIRED_FIELDS,
     USER_PROFILE_COLLECTION_CONTRACT,
     canonical_backend_uuid,
+    legacy_repository_point_id,
+    legacy_user_point_id,
     repository_payload_defaults,
     repository_point_id,
     user_point_id,
@@ -48,6 +52,15 @@ def test_point_ids_are_canonical_backend_uuids():
     assert user_point_id(REPO_ID) == user_point_id(f" {REPO_ID} ")
     assert repository_point_id(REPO_ID) == user_point_id(REPO_ID) == REPO_ID
     assert repository_point_id(REPO_ID) != repository_point_id(OTHER_REPO_ID)
+
+
+def test_legacy_point_ids_preserve_the_pre_v2_uuid5_mapping():
+    assert legacy_repository_point_id(REPO_ID) == str(
+        uuid.uuid5(uuid.NAMESPACE_URL, f"github:{REPO_ID}")
+    )
+    assert legacy_user_point_id(REPO_ID) == str(
+        uuid.uuid5(uuid.NAMESPACE_URL, f"user:{REPO_ID}")
+    )
 
 
 def test_backend_ids_are_canonical_valid_uuids():

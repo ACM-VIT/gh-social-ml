@@ -10,6 +10,7 @@ from typing import Any
 from qdrant_client import QdrantClient
 
 from config import QDRANT_API_KEY, QDRANT_COLLECTION_NAME, QDRANT_URL, QDRANT_VECTOR_NAME
+from embedding.vector_contract import legacy_repository_point_id, user_point_ids
 from scripts.user_onboarding import TARGET_VECTOR_NAME, USER_PROFILES_COLLECTION
 
 
@@ -50,7 +51,9 @@ class QdrantV2Retriever:
             canonical = str(uuid.UUID(candidate))
         except (ValueError, AttributeError):
             return None
-        return canonical if str(point.id) == canonical and payload.get("repo_id") == canonical else None
+        valid_point_ids = {canonical, legacy_repository_point_id(canonical)}
+        has_canonical_payload = str(payload.get("repo_id")) == canonical
+        return canonical if str(point.id) in valid_point_ids and has_canonical_payload else None
 
     @staticmethod
     def _vector(value: Any, preferred: str | None = None) -> list[float] | None:
@@ -65,15 +68,18 @@ class QdrantV2Retriever:
         return list(value)
 
     def _user_vector(self, user_id: str) -> list[float] | None:
+        canonical, legacy = user_point_ids(user_id)
         points = self.client.retrieve(
             collection_name=self.user_collection,
-            ids=[str(uuid.UUID(user_id))],
+            ids=[canonical, legacy],
             with_vectors=True,
             with_payload=True,
         )
         if not points:
             return None
-        return self._vector(points[0].vector, TARGET_VECTOR_NAME)
+        by_id = {str(point.id): point for point in points}
+        point = by_id.get(canonical) or by_id.get(legacy)
+        return self._vector(point.vector, TARGET_VECTOR_NAME) if point else None
 
     def _semantic(self, vector: list[float], limit: int) -> list[tuple[Any, float]]:
         response = self.client.query_points(

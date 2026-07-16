@@ -173,6 +173,47 @@ def test_pipeline_onboarding_stores_contract_metadata_and_feedback_accumulator()
     assert profile["topics"] == ["machine-learning"]
 
 
+def test_profile_update_preserves_learned_vector_and_feedback_cursor():
+    learned_vector = [0.0, 1.0] + [0.0] * (VECTOR_DIMENSION - 2)
+    learned_latent = [0.25, 0.75] + [0.0] * (VECTOR_DIMENSION - 2)
+
+    class ExistingUserStore(FakeUserStore):
+        def retrieve_user(self, user_id):
+            return SimpleNamespace(
+                id=user_id,
+                vector=learned_vector,
+                payload={
+                    "user_id": user_id,
+                    "profile_version": 3,
+                    "last_feedback_version": 12,
+                    "last_feedback_event_id": "event-12",
+                    "feedback_latent_vector": learned_latent,
+                    "feedback_adjustments": {"repo": {"reaction": {"action": "like"}}},
+                    "feedback_applied_signals": {"repo": ["readme_open"]},
+                    "preference_accumulator": learned_latent,
+                },
+            )
+
+    store = ExistingUserStore()
+    pipeline = UserOnboardingPipeline(model=FakeModel(), store=store)
+    new_baseline = pipeline.generate_interest_vector({"topics": ["databases"]})
+
+    pipeline.save_to_qdrant(
+        USER_ID,
+        new_baseline,
+        {"topics": ["databases"], "profile_version": 4, "job_id": JOB_ID},
+    )
+
+    _, stored_vector, payload = store.upsert_call
+    assert stored_vector == learned_vector
+    assert payload["profile_version"] == 4
+    assert payload["last_feedback_version"] == 12
+    assert payload["last_feedback_event_id"] == "event-12"
+    assert payload["feedback_latent_vector"] == learned_latent
+    assert payload["preference_accumulator"] == learned_latent
+    assert payload["profile_baseline_vector"] == new_baseline
+
+
 def test_user_store_creates_an_unnamed_collection_and_deterministic_point():
     client = FakeQdrantClient(exists=False)
     store = QdrantUserProfileStore(client=client)

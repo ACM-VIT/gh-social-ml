@@ -1,12 +1,19 @@
 import uuid
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from api.v2 import FeedbackBatch, RecommendationRequest, router
+from api.v2 import (
+    FeedbackBatch,
+    RecommendationRequest,
+    _repository_job_lock,
+    _repository_job_status,
+    router,
+)
 from embedding.qdrant_store import QdrantRepositoryStore
 
 
@@ -55,3 +62,48 @@ def test_v2_health_requires_internal_auth(monkeypatch):
     monkeypatch.delenv("INTERNAL_API_SECRET")
     response = client.get("/api/v2/health")
     assert response.status_code == 503
+
+
+def test_repository_jobs_are_idempotent_and_monotonic():
+    job_id = str(uuid.uuid4())
+    points = [
+        SimpleNamespace(
+            payload={"content_version": 7, "content_job_id": job_id}
+        )
+    ]
+    assert _repository_job_status(
+        points,
+        version_field="content_version",
+        job_field="content_job_id",
+        requested_version=7,
+        job_id=job_id,
+    ) == ("duplicate", 7)
+    assert _repository_job_status(
+        points,
+        version_field="content_version",
+        job_field="content_job_id",
+        requested_version=7,
+        job_id=str(uuid.uuid4()),
+    ) == ("current", 7)
+
+    with pytest.raises(HTTPException) as exc_info:
+        _repository_job_status(
+            points,
+            version_field="content_version",
+            job_field="content_job_id",
+            requested_version=6,
+            job_id=str(uuid.uuid4()),
+        )
+    assert exc_info.value.status_code == 409
+
+
+def test_repository_job_lock_uses_token_checked_release():
+    redis = MagicMock()
+    redis.set.return_value = True
+    with patch("api.v2.producer", return_value=SimpleNamespace(redis=redis)):
+        with _repository_job_lock(str(uuid.uuid4())):
+            pass
+
+    redis.set.assert_called_once()
+    assert redis.set.call_args.kwargs == {"nx": True, "px": 600_000}
+    redis.eval.assert_called_once()

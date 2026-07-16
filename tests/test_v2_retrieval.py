@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from embedding.vector_contract import legacy_repository_point_id, legacy_user_point_id
 from retrieval.v2_retriever import QdrantV2Retriever
 
 
@@ -33,6 +34,40 @@ def test_qdrant_only_retrieval_deduplicates_and_rejects_legacy_identity():
     items = retriever.recommend(client.user_id, 10, [])
     assert {item.repo_id for item in items} == set(client.repo_ids)
     assert len(items) == 2
+
+
+def test_qdrant_only_retrieval_reads_pre_v2_uuid5_points():
+    client = FakeQdrant()
+    user_id = client.user_id
+    repo_id = client.repo_ids[0]
+
+    def retrieve(collection_name, ids, with_vectors, with_payload=True):
+        assert legacy_user_point_id(user_id) in ids
+        return [
+            SimpleNamespace(
+                id=legacy_user_point_id(user_id),
+                vector=[1.0, 0.0],
+                payload={"user_id": user_id, "last_feedback_version": 4},
+            )
+        ]
+
+    def query_points(**_kwargs):
+        return SimpleNamespace(
+            points=[
+                SimpleNamespace(
+                    id=legacy_repository_point_id(repo_id),
+                    score=0.9,
+                    payload={"repo_id": repo_id, "star_count": 50},
+                )
+            ]
+        )
+
+    client.retrieve = retrieve
+    client.query_points = query_points
+    client.scroll = lambda **_kwargs: ([], None)
+
+    items = QdrantV2Retriever(client=client).recommend(user_id, 10, [])
+    assert [item.repo_id for item in items] == [repo_id]
 
 
 def test_discovery_score_treats_zero_pushed_days_as_fresh():

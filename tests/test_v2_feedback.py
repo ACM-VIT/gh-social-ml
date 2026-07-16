@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from embedding.vector_contract import legacy_repository_point_id, legacy_user_point_id
 from feedback.event_handlers import ADJUSTMENTS_KEY, APPLIED_SIGNALS_KEY, LATENT_KEY
 from feedback.v2 import OrderedFeedbackApplier
 
@@ -44,9 +45,37 @@ def test_feedback_applies_version_with_vector_in_one_upsert():
     assert np.allclose(point.payload[LATENT_KEY], [0.85, 0.15])
 
 
+def test_feedback_reads_and_updates_pre_v2_uuid5_points():
+    user_id, repo_id = str(uuid.uuid4()), str(uuid.uuid4())
+    client = FakeQdrant(user_id, repo_id)
+    client.user.id = legacy_user_point_id(user_id)
+    legacy_repo_id = legacy_repository_point_id(repo_id)
+
+    def retrieve(collection_name, ids, with_payload, with_vectors):
+        if client.user.id in ids:
+            return [client.user]
+        assert legacy_repo_id in ids
+        return [
+            SimpleNamespace(
+                id=legacy_repo_id,
+                vector={"repo_embedding": [0.0, 1.0]},
+                payload={"repo_id": repo_id},
+            )
+        ]
+
+    client.retrieve = retrieve
+    result = OrderedFeedbackApplier(client).apply(event(user_id, repo_id, 1))
+
+    assert result.status == "applied"
+    assert client.upserts[0]["points"][0].id == legacy_user_point_id(user_id)
+    assert client.user.payload["last_feedback_version"] == 1
+
+
 def test_feedback_skips_duplicate_and_holds_version_gap():
     user_id, repo_id = str(uuid.uuid4()), str(uuid.uuid4())
-    duplicate = OrderedFeedbackApplier(FakeQdrant(user_id, repo_id, last=2)).apply(event(user_id, repo_id, 2))
+    duplicate = OrderedFeedbackApplier(
+        FakeQdrant(user_id, repo_id, last=2)
+    ).apply(event(user_id, repo_id, 2))
     gap_client = FakeQdrant(user_id, repo_id, last=2)
     gap = OrderedFeedbackApplier(gap_client).apply(event(user_id, repo_id, 4))
     assert duplicate.status == "duplicate"

@@ -66,9 +66,9 @@ class FakeQdrant:
 
     def retrieve(self, *, collection_name, ids, with_payload, with_vectors):
         if collection_name == "user_profiles":
-            return [self.user] if self.user and ids == [self.user.id] else []
+            return [self.user] if self.user and self.user.id in ids else []
         self.repo_reads += 1
-        return [self.repo] if self.repo and ids == [self.repo.id] else []
+        return [self.repo] if self.repo and self.repo.id in ids else []
 
     def upsert(self, *, collection_name, points, wait):
         point = points[0]

@@ -11,7 +11,7 @@ import numpy as np
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct
 
-from embedding.vector_contract import repository_point_id, user_point_id
+from embedding.vector_contract import repository_point_ids, user_point_ids
 
 from .interactions import get_interaction, normalize_interaction
 from .settings import FeedbackSettings
@@ -233,10 +233,10 @@ class FeedbackHandler:
         dwell_seconds: float | None,
     ) -> bool:
         definition = get_interaction(action)
-        user_id_qdrant = user_point_id(user_id)
+        canonical_user_id, legacy_user_id = user_point_ids(user_id)
         user_points = self.qdrant.retrieve(
             collection_name=self.settings.user_collection,
-            ids=[user_id_qdrant],
+            ids=[canonical_user_id, legacy_user_id],
             with_payload=True,
             with_vectors=True,
         )
@@ -244,7 +244,11 @@ class FeedbackHandler:
             logger.warning("User profile %s is not available yet", user_id)
             return False
 
-        point = user_points[0]
+        points_by_id = {str(candidate.id): candidate for candidate in user_points}
+        point = points_by_id.get(canonical_user_id) or points_by_id.get(legacy_user_id)
+        if point is None:
+            logger.warning("User profile %s is not available yet", user_id)
+            return False
         search_vector, vector_name = _point_vector(
             point, self.settings.user_vector_name, label="user profile"
         )
@@ -361,18 +365,23 @@ class FeedbackHandler:
         return True
 
     def _repository_vector(self, repo_id: str) -> list[float] | None:
-        point_id = repository_point_id(repo_id)
+        canonical_repo_id, legacy_repo_id = repository_point_ids(repo_id)
         points = self.qdrant.retrieve(
             collection_name=self.settings.repository_collection,
-            ids=[point_id],
+            ids=[canonical_repo_id, legacy_repo_id],
             with_payload=False,
             with_vectors=True,
         )
         if not points:
             logger.warning("Repository vector %s is not available", repo_id)
             return None
+        points_by_id = {str(point.id): point for point in points}
+        point = points_by_id.get(canonical_repo_id) or points_by_id.get(legacy_repo_id)
+        if point is None:
+            logger.warning("Repository vector %s is not available", repo_id)
+            return None
         vector, _ = _point_vector(
-            points[0], self.settings.repository_vector_name, label="repository"
+            point, self.settings.repository_vector_name, label="repository"
         )
         return _vector(
             vector, self.settings.vector_dimension, label="repository vector"

@@ -15,6 +15,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct
 
 from config import QDRANT_API_KEY, QDRANT_COLLECTION_NAME, QDRANT_URL, QDRANT_VECTOR_NAME
+from embedding.vector_contract import repository_point_ids, user_point_ids
 from feedback.event_handlers import (
     ADJUSTMENTS_KEY,
     APPLIED_SIGNALS_KEY,
@@ -183,15 +184,19 @@ class OrderedFeedbackApplier:
         user_id = str(uuid.UUID(event["user_id"]))
         repo_id = str(uuid.UUID(event["repo_id"]))
         version = int(event["feedback_version"])
+        canonical_user_id, legacy_user_id = user_point_ids(user_id)
         users = self.qdrant.retrieve(
             collection_name=USER_PROFILES_COLLECTION,
-            ids=[user_id],
+            ids=[canonical_user_id, legacy_user_id],
             with_payload=True,
             with_vectors=True,
         )
         if not users:
             raise LookupError(f"user vector {user_id} is not indexed")
-        user = users[0]
+        users_by_id = {str(point.id): point for point in users}
+        user = users_by_id.get(canonical_user_id) or users_by_id.get(legacy_user_id)
+        if user is None:
+            raise LookupError(f"user vector {user_id} is not indexed")
         payload = dict(user.payload or {})
         last = int(payload.get("last_feedback_version") or 0)
         if version <= last:
@@ -211,15 +216,20 @@ class OrderedFeedbackApplier:
         definition = get_interaction(event["event_type"])
 
         def repository_vector() -> np.ndarray:
+            canonical_repo_id, legacy_repo_id = repository_point_ids(repo_id)
             repos = self.qdrant.retrieve(
                 collection_name=QDRANT_COLLECTION_NAME,
-                ids=[repo_id],
+                ids=[canonical_repo_id, legacy_repo_id],
                 with_payload=False,
                 with_vectors=True,
             )
             if not repos:
                 raise LookupError(f"repository vector {repo_id} is not indexed")
-            value, _ = self._vector(repos[0].vector, QDRANT_VECTOR_NAME)
+            repos_by_id = {str(point.id): point for point in repos}
+            repo = repos_by_id.get(canonical_repo_id) or repos_by_id.get(legacy_repo_id)
+            if repo is None:
+                raise LookupError(f"repository vector {repo_id} is not indexed")
+            value, _ = self._vector(repo.vector, QDRANT_VECTOR_NAME)
             return self._finite_vector(value, dimension, label="repository vector")
 
         def transition_delta() -> np.ndarray:
@@ -275,7 +285,7 @@ class OrderedFeedbackApplier:
         stored_vector: Any = vector if user_vector_name is None else {user_vector_name: vector}
         self.qdrant.upsert(
             collection_name=USER_PROFILES_COLLECTION,
-            points=[PointStruct(id=user_id, vector=stored_vector, payload=payload)],
+            points=[PointStruct(id=user.id, vector=stored_vector, payload=payload)],
             wait=True,
         )
         return ApplyResult("applied", version)
