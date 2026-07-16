@@ -41,6 +41,7 @@ def test_feedback_applies_version_with_vector_in_one_upsert():
     assert result.status == "applied"
     point = client.upserts[0]["points"][0]
     assert point.payload["last_feedback_version"] == 1
+    assert np.allclose(point.payload[LATENT_KEY], [0.85, 0.15])
 
 
 def test_feedback_skips_duplicate_and_holds_version_gap():
@@ -83,7 +84,10 @@ def test_reversal_preserves_later_unrelated_feedback():
     applier.apply(event(user_id, repo_id, 2, "readme_open"))
     applier.apply(event(user_id, repo_id, 3, "unlike"))
 
-    expected = np.asarray([1.0, 0.05])
+    # like: [1, 0] + 0.15 * ([0, 1] - [1, 0]) = [0.85, 0.15]
+    # readme_open then contributes 0.05 * ([0, 1] - [0.85, 0.15]).
+    # Reversing like removes only its exact stored delta.
+    expected = np.asarray([0.9575, 0.0425])
     expected /= np.linalg.norm(expected)
     assert np.allclose(client.user.vector, expected)
 

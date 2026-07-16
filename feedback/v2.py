@@ -15,7 +15,12 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct
 
 from config import QDRANT_API_KEY, QDRANT_COLLECTION_NAME, QDRANT_URL, QDRANT_VECTOR_NAME
-from feedback.event_handlers import ADJUSTMENTS_KEY, APPLIED_SIGNALS_KEY, LATENT_KEY
+from feedback.event_handlers import (
+    ADJUSTMENTS_KEY,
+    APPLIED_SIGNALS_KEY,
+    LATENT_KEY,
+    vector_delta,
+)
 from feedback.interactions import get_interaction
 from scripts.user_onboarding import TARGET_VECTOR_NAME, USER_PROFILES_COLLECTION
 
@@ -217,6 +222,13 @@ class OrderedFeedbackApplier:
             value, _ = self._vector(repos[0].vector, QDRANT_VECTOR_NAME)
             return self._finite_vector(value, dimension, label="repository vector")
 
+        def transition_delta() -> np.ndarray:
+            return self._finite_vector(
+                vector_delta(accumulator, repository_vector(), self._alpha(event)),
+                dimension,
+                label="feedback delta",
+            )
+
         if definition.reversal_of:
             family = definition.state_family or ""
             stored = repo_state.get(family)
@@ -233,7 +245,7 @@ class OrderedFeedbackApplier:
                     accumulator -= self._finite_vector(
                         stored.get("delta"), dimension, label="stored feedback delta"
                     )
-                delta = self._alpha(event) * repository_vector()
+                delta = transition_delta()
                 accumulator += delta
                 repo_state[family] = {
                     "action": event["event_type"],
@@ -243,10 +255,10 @@ class OrderedFeedbackApplier:
         elif definition.apply_once:
             repo_signals = applied_signals.setdefault(repo_id, [])
             if event["event_type"] not in repo_signals:
-                accumulator += self._alpha(event) * repository_vector()
+                accumulator += transition_delta()
                 repo_signals.append(event["event_type"])
         else:
-            accumulator += self._alpha(event) * repository_vector()
+            accumulator += transition_delta()
 
         if not repo_state:
             adjustments.pop(repo_id, None)
