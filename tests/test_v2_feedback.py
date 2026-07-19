@@ -1,3 +1,4 @@
+import threading
 import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -7,7 +8,12 @@ import pytest
 
 from embedding.vector_contract import legacy_repository_point_id, legacy_user_point_id
 from feedback.event_handlers import ADJUSTMENTS_KEY, APPLIED_SIGNALS_KEY, LATENT_KEY
-from feedback.v2 import DurableFeedbackProducer, OrderedFeedbackApplier
+from feedback.v2 import (
+    CONSUMER_HEARTBEAT,
+    DurableFeedbackProducer,
+    OrderedFeedbackApplier,
+    OrderedFeedbackConsumer,
+)
 
 
 class FakeQdrant:
@@ -48,6 +54,36 @@ def test_v2_feedback_health_reports_dedicated_consumer_heartbeat():
     assert health["feedback_pending"] == 2
     assert health["feedback_lag"] == 3
     assert health["feedback_consumer_active"] is True
+
+
+def test_consumer_refreshes_heartbeat_during_slow_processing(monkeypatch):
+    redis = MagicMock()
+    heartbeat_renewed = threading.Event()
+    heartbeat_writes = 0
+
+    def record_set(key, *args, **kwargs):
+        nonlocal heartbeat_writes
+        if key == CONSUMER_HEARTBEAT:
+            heartbeat_writes += 1
+            if heartbeat_writes >= 2:
+                heartbeat_renewed.set()
+        return True
+
+    redis.set.side_effect = record_set
+    applier = MagicMock()
+    applier.apply.side_effect = lambda payload: (
+        SimpleNamespace(status="applied")
+        if heartbeat_renewed.wait(timeout=1)
+        else pytest.fail("heartbeat was not refreshed while processing")
+    )
+    consumer = OrderedFeedbackConsumer(redis_client=redis, applier=applier)
+    consumer._messages = lambda: iter(
+        [("1-0", {"user_id": str(uuid.uuid4())})]
+    )
+    monkeypatch.setattr("feedback.v2.CONSUMER_HEARTBEAT_TTL_SECONDS", 0.3)
+
+    assert consumer.run_once() == 1
+    assert heartbeat_writes >= 3
 
 
 def test_feedback_applies_version_with_vector_in_one_upsert():
