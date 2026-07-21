@@ -377,7 +377,7 @@ requires-dist = [
     { name = "numpy" },
     { name = "pg8000" },
     { name = "python-dotenv" },
-    { name = "qdrant-client" },
+    { name = "qdrant-client", specifier = ">=1.18.0,<2" },
     { name = "redis", specifier = ">=5.0.0" },
     { name = "requests" },
     { name = "schedule" },

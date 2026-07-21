@@ -13,13 +13,17 @@ from config import (
     QDRANT_COLLECTION_NAME,
     QDRANT_DISTANCE,
     QDRANT_PAYLOAD_INDEX_FIELDS,
+    QDRANT_PAYLOAD_INDEX_SCHEMA,
     QDRANT_URL,
     QDRANT_VECTOR_NAME,
     REPOSITORY_EMBEDDING_DIM,
 )
+from .qdrant_cas import payload_matches, payload_snapshot_filter
 from .repository_embedding import RepositoryEmbeddingResult
 from .vector_contract import (
     REPOSITORY_DISCOVERY_CHANNELS,
+    REPOSITORY_SERVING_ELIGIBILITY_FIELD,
+    REPOSITORY_SERVING_ELIGIBILITY_VERSION,
     canonical_backend_uuid,
     repository_point_id,
     validate_embedding_vector,
@@ -91,30 +95,188 @@ class QdrantRepositoryStore:
         """Upsert embedding results into Qdrant."""
         points = []
         for result in results:
-            point_id = self._point_id(result.repo_id)
-            vector = validate_embedding_vector(
-                result.final_embedding,
-                expected_size=self.vector_size,
-                field_name=f"embedding for {result.repo_id}",
-            )
-            validate_repository_payload(result.payload)
-            if result.payload["repo_id"].strip() != result.repo_id.strip():
-                raise ValueError(
-                    "embedding result repo_id does not match its repository payload"
-                )
             # The below deterministic ID is for safe re-runs; the same repo is
             # updated instead of inserted as a duplicate vector.
             points.append(
-                self.models.PointStruct(
-                    id=point_id,
-                    vector={self.vector_name: vector},
-                    payload=result.payload,
+                self._validated_point(
+                    result,
+                    point_id=self._point_id(result.repo_id),
                 )
             )
         if not points:
             return
-        self.client.upsert(collection_name=self.collection_name, points=points)
+        self.client.upsert(
+            collection_name=self.collection_name,
+            points=points,
+            wait=True,
+        )
         logger.info("Upserted %d repository vectors into %s", len(points), self.collection_name)
+
+    def compare_and_set_content(
+        self,
+        result: RepositoryEmbeddingResult,
+        *,
+        expected_point: Any | None,
+    ) -> Any | None:
+        """Write content only when the observed content and features remain current.
+
+        Qdrant evaluates the conditional filter atomically. Including the
+        independent feature revision prevents an embedding worker that lost
+        its Redis lease from erasing a newer feature refresh. Existing legacy
+        point IDs are updated in place; online identity migration is unsafe
+        because Qdrant has no transaction spanning delete plus insert.
+
+        Qdrant reports a filtered no-op as a completed operation, so this
+        method returns a post-write read of the exact target for verification.
+        """
+
+        target_id = (
+            self._point_id(result.repo_id)
+            if expected_point is None
+            else str(expected_point.id)
+        )
+        point = self._validated_point(result, point_id=target_id)
+        kwargs: dict[str, Any] = {
+            "collection_name": self.collection_name,
+            "points": [point],
+            "wait": True,
+            "ordering": self.models.WriteOrdering.STRONG,
+        }
+        if expected_point is None:
+            kwargs["update_mode"] = self.models.UpdateMode.INSERT_ONLY
+        else:
+            desired_payload = dict(point.payload or {})
+            expected_payload = dict(expected_point.payload or {})
+            current_version = self._stored_version(
+                expected_payload,
+                "content_version",
+            )
+            requested_version = self._stored_version(
+                desired_payload,
+                "content_version",
+            )
+            if requested_version < current_version:
+                raise ValueError("content_version cannot move backwards")
+            if (
+                requested_version == current_version
+                and str(desired_payload.get("content_job_id") or "")
+                != str(expected_payload.get("content_job_id") or "")
+            ):
+                raise ValueError(
+                    "a content revision cannot be replaced by a different job_id"
+                )
+            if not payload_matches(
+                desired_payload,
+                expected_payload,
+                ("feature_version", "feature_job_id"),
+            ):
+                raise ValueError(
+                    "content upsert must preserve the observed feature revision"
+                )
+            kwargs.update(
+                update_mode=self.models.UpdateMode.UPDATE_ONLY,
+                update_filter=payload_snapshot_filter(
+                    self.models,
+                    point_id=expected_point.id,
+                    payload=expected_payload,
+                    fields=(
+                        "content_version",
+                        "content_job_id",
+                        "feature_version",
+                        "feature_job_id",
+                    ),
+                ),
+            )
+        self.client.upsert(**kwargs)
+        return self._retrieve_point(target_id)
+
+    def compare_and_set_features(
+        self,
+        *,
+        expected_point: Any,
+        feature_payload: Mapping[str, Any],
+    ) -> Any | None:
+        """Apply a feature patch only to the exact feature revision read."""
+
+        if expected_point is None:
+            raise ValueError("expected_point is required for a feature refresh")
+        if not isinstance(feature_payload, Mapping) or not feature_payload:
+            raise ValueError("feature_payload must be a non-empty mapping")
+        expected_payload = dict(expected_point.payload or {})
+        current_version = self._stored_version(expected_payload, "feature_version")
+        requested_version = self._stored_version(feature_payload, "feature_version")
+        if requested_version < current_version:
+            raise ValueError("feature_version cannot move backwards")
+        if (
+            requested_version == current_version
+            and str(feature_payload.get("feature_job_id") or "")
+            != str(expected_payload.get("feature_job_id") or "")
+        ):
+            raise ValueError(
+                "a feature revision cannot be replaced by a different job_id"
+            )
+        selector = payload_snapshot_filter(
+            self.models,
+            point_id=expected_point.id,
+            payload=expected_payload,
+            fields=("feature_version", "feature_job_id"),
+        )
+        self.client.set_payload(
+            collection_name=self.collection_name,
+            payload=dict(feature_payload),
+            points=selector,
+            wait=True,
+            ordering=self.models.WriteOrdering.STRONG,
+        )
+        return self._retrieve_point(str(expected_point.id))
+
+    def _validated_point(
+        self,
+        result: RepositoryEmbeddingResult,
+        *,
+        point_id: str,
+    ) -> Any:
+        vector = validate_embedding_vector(
+            result.final_embedding,
+            expected_size=self.vector_size,
+            field_name=f"embedding for {result.repo_id}",
+        )
+        validate_repository_payload(
+            result.payload,
+            require_serving_eligibility=False,
+        )
+        if result.payload["repo_id"].strip() != result.repo_id.strip():
+            raise ValueError(
+                "embedding result repo_id does not match its repository payload"
+            )
+        serving_payload = dict(result.payload)
+        serving_payload[REPOSITORY_SERVING_ELIGIBILITY_FIELD] = (
+            REPOSITORY_SERVING_ELIGIBILITY_VERSION
+        )
+        validate_repository_payload(serving_payload)
+        return self.models.PointStruct(
+            id=point_id,
+            vector={self.vector_name: vector},
+            payload=serving_payload,
+        )
+
+    def _retrieve_point(self, point_id: str) -> Any | None:
+        records = self.client.retrieve(
+            collection_name=self.collection_name,
+            ids=[point_id],
+            with_payload=True,
+            with_vectors=False,
+        )
+        return records[0] if records else None
+
+    @staticmethod
+    def _stored_version(payload: Mapping[str, Any], field: str) -> int:
+        raw = payload.get(field, 0)
+        if raw is None:
+            return 0
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+            raise ValueError(f"stored {field} must be a non-negative integer")
+        return raw
 
     def search(
         self,
@@ -338,23 +500,14 @@ class QdrantRepositoryStore:
     def _create_payload_index(self, field_name: str) -> None:
         # The below schema selection is for keeping payload indexes aligned with
         # the payload fields emitted by build_vector_payload.
-        schema = self.models.PayloadSchemaType.KEYWORD
-        if field_name in {"star_count", "pushed_days_ago", "content_version"}:
-            schema = self.models.PayloadSchemaType.INTEGER
-        elif field_name in {
-            "trend_velocity",
-            "activity_score",
-            "doc_quality",
-            "code_health",
-        }:
-            schema = self.models.PayloadSchemaType.FLOAT
-        elif field_name in {"updated_at", "pushed_at"}:
-            schema = self.models.PayloadSchemaType.DATETIME
+        schema_name = QDRANT_PAYLOAD_INDEX_SCHEMA[field_name]
+        schema = getattr(self.models.PayloadSchemaType, schema_name.upper())
         try:
             self.client.create_payload_index(
                 collection_name=self.collection_name,
                 field_name=field_name,
                 field_schema=schema,
+                wait=True,
             )
         except Exception as exc:
             raise RuntimeError(f"Failed to create Qdrant payload index {field_name!r}") from exc

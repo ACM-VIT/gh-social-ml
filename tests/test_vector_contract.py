@@ -18,6 +18,8 @@ from embedding.vector_contract import (
     REPOSITORY_COLLECTION_CONTRACT,
     REPOSITORY_PAYLOAD_FIELD_TYPES,
     REPOSITORY_PAYLOAD_REQUIRED_FIELDS,
+    REPOSITORY_SERVING_ELIGIBILITY_FIELD,
+    REPOSITORY_SERVING_ELIGIBILITY_VERSION,
     USER_PROFILE_COLLECTION_CONTRACT,
     canonical_backend_uuid,
     legacy_repository_point_id,
@@ -102,6 +104,7 @@ def test_repository_payload_contract_has_identity_and_embedding_fields():
         "model_version",
         "indexed_at",
         "source_hash",
+        REPOSITORY_SERVING_ELIGIBILITY_FIELD,
     }.issubset(REPOSITORY_PAYLOAD_REQUIRED_FIELDS)
 
 
@@ -114,6 +117,10 @@ def test_repository_payload_defaults_are_fresh_and_match_current_model():
     assert second["languages"] == []
     assert second["embedding_dim"] == 384
     assert second["embedding_model"] == REPOSITORY_EMBEDDING_MODEL
+    assert (
+        second[REPOSITORY_SERVING_ELIGIBILITY_FIELD]
+        == REPOSITORY_SERVING_ELIGIBILITY_VERSION
+    )
 
 
 def test_current_payload_builder_publishes_the_frozen_contract():
@@ -133,6 +140,10 @@ def test_current_payload_builder_publishes_the_frozen_contract():
         config=RepositoryEmbeddingConfig(),
     )
 
-    assert set(payload) == set(REPOSITORY_PAYLOAD_REQUIRED_FIELDS)
+    assert set(payload) == set(REPOSITORY_PAYLOAD_REQUIRED_FIELDS) - {
+        REPOSITORY_SERVING_ELIGIBILITY_FIELD
+    }
     for field_name, expected_type in REPOSITORY_PAYLOAD_FIELD_TYPES.items():
+        if field_name == REPOSITORY_SERVING_ELIGIBILITY_FIELD:
+            continue
         assert isinstance(payload[field_name], expected_type), field_name

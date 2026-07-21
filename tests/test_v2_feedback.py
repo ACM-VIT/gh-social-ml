@@ -6,7 +6,18 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-from embedding.vector_contract import legacy_repository_point_id, legacy_user_point_id
+from config import (
+    EMBEDDING_MODEL_REVISION,
+    REPOSITORY_EMBEDDING_MODEL,
+    REPOSITORY_EMBEDDING_VERSION,
+    REPOSITORY_FEATURE_SPEC_VERSION,
+)
+from embedding.vector_contract import (
+    REPOSITORY_SERVING_ELIGIBILITY_FIELD,
+    REPOSITORY_SERVING_ELIGIBILITY_VERSION,
+    legacy_repository_point_id,
+    legacy_user_point_id,
+)
 from feedback.event_handlers import ADJUSTMENTS_KEY, APPLIED_SIGNALS_KEY, LATENT_KEY
 from feedback.v2 import (
     CONSUMER_HEARTBEAT,
@@ -30,7 +41,16 @@ class FakeQdrant:
     def retrieve(self, collection_name, ids, with_payload, with_vectors):
         if ids[0] == self.user_id:
             return [self.user]
-        return [SimpleNamespace(id=self.repo_id, vector={"repo_embedding": [0.0, 1.0]}, payload={})]
+        return [SimpleNamespace(id=self.repo_id, vector={"repo_embedding": [0.0, 1.0]}, payload={
+            "repo_id": self.repo_id,
+            REPOSITORY_SERVING_ELIGIBILITY_FIELD: REPOSITORY_SERVING_ELIGIBILITY_VERSION,
+            "content_version": 1,
+            "embedding_model": REPOSITORY_EMBEDDING_MODEL,
+            "embedding_model_revision": EMBEDDING_MODEL_REVISION,
+            "embedding_version": REPOSITORY_EMBEDDING_VERSION,
+            "embedding_dim": 2,
+            "feature_spec_version": REPOSITORY_FEATURE_SPEC_VERSION,
+        })]
 
     def upsert(self, **kwargs):
         self.upserts.append(kwargs)
@@ -47,7 +67,7 @@ def test_v2_feedback_health_reports_dedicated_consumer_heartbeat():
     redis.xinfo_groups.return_value = [
         {"name": "ml-feedback-v2", "pending": 2, "lag": 3}
     ]
-    redis.exists.return_value = 1
+    redis.get.return_value = "development|feedback-worker"
 
     health = DurableFeedbackProducer(redis).health()
 
@@ -110,7 +130,17 @@ def test_feedback_reads_and_updates_pre_v2_uuid5_points():
             SimpleNamespace(
                 id=legacy_repo_id,
                 vector={"repo_embedding": [0.0, 1.0]},
-                payload={"repo_id": repo_id},
+                payload={
+                    "repo_id": repo_id,
+                    REPOSITORY_SERVING_ELIGIBILITY_FIELD:
+                        REPOSITORY_SERVING_ELIGIBILITY_VERSION,
+                    "content_version": 1,
+                    "embedding_model": REPOSITORY_EMBEDDING_MODEL,
+                    "embedding_model_revision": EMBEDDING_MODEL_REVISION,
+                    "embedding_version": REPOSITORY_EMBEDDING_VERSION,
+                    "embedding_dim": 2,
+                    "feature_spec_version": REPOSITORY_FEATURE_SPEC_VERSION,
+                },
             )
         ]
 
@@ -124,9 +154,10 @@ def test_feedback_reads_and_updates_pre_v2_uuid5_points():
 
 def test_feedback_skips_duplicate_and_holds_version_gap():
     user_id, repo_id = str(uuid.uuid4()), str(uuid.uuid4())
-    duplicate = OrderedFeedbackApplier(
-        FakeQdrant(user_id, repo_id, last=2)
-    ).apply(event(user_id, repo_id, 2))
+    duplicate_event = event(user_id, repo_id, 2)
+    duplicate_client = FakeQdrant(user_id, repo_id, last=2)
+    duplicate_client.user.payload["last_feedback_event_id"] = duplicate_event["event_id"]
+    duplicate = OrderedFeedbackApplier(duplicate_client).apply(duplicate_event)
     gap_client = FakeQdrant(user_id, repo_id, last=2)
     gap = OrderedFeedbackApplier(gap_client).apply(event(user_id, repo_id, 4))
     assert duplicate.status == "duplicate"

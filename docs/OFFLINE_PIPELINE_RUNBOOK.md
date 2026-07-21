@@ -6,6 +6,8 @@ This runbook covers the two Person 1 worker processes:
 2. enriched GitHub Trending snapshot delivery to backend v2.
 
 Both are offline jobs. Do not invoke either command from an API request handler.
+For the Redis/Qdrant online services, deployment, feedback replay, alerting, and
+rollout procedures, use the [V2 production operations runbook](PRODUCTION_RUNBOOK.md).
 
 ## Safety contract
 
@@ -42,12 +44,6 @@ uv run python main.py --validate-config
 uv run python trending_service.py --validate-config
 ```
 
-If Qdrant is intentionally unavailable during a Postgres-only maintenance window:
-
-```bash
-uv run python main.py --validate-config --no-index-qdrant
-```
-
 Validation success does not prove that credentials are accepted or that a remote service is healthy. It proves the local worker configuration is internally valid.
 
 ## Corpus acquisition
@@ -73,18 +69,20 @@ Embedding and Qdrant indexing are scheduled by the backend outbox after successf
 - Stop the foreground process with `Ctrl+C` or the platform's normal `SIGTERM` shutdown.
 - Do not delete the checkpoint after an interrupted or degraded run.
 - Restart with the same configuration and checkpoint path.
-- Pending Qdrant indexing is attempted before new discovery.
-- Pending persistence is re-enriched from its repository identity before retry.
+- Pending backend delivery is re-enriched from its repository identity before retry.
 
 The default checkpoint is `.cache/acquisition_checkpoint.json`. Writes use atomic replacement. Do not edit the file while a worker is running.
 
 ### Corpus exit codes
 
 - `0`: the bounded invocation completed, including a no-work target-reached run.
-- `1`: configuration, startup, Postgres verification, or pipeline execution failed.
-- `2`: failures were recorded and the run made no persistence or indexing progress.
+- `1`: configuration, startup, backend verification, or pipeline execution failed.
+- `2`: failures were recorded and the run made no backend-delivery progress.
 
-Inspect the final `Corpus run report` log and the checkpoint's `last_run`, `failures`, `pending_persistence`, and `pending_index` fields before retrying an exit code `2`.
+Inspect the final `Corpus run report` log and the checkpoint's `last_run`,
+`failures`, and `pending_persistence` fields before retrying an exit code `2`.
+`pending_index` is retained only for checkpoint backward compatibility; the
+production worker does not write Qdrant directly.
 
 ## Trending refresh
 
@@ -109,10 +107,10 @@ The production path is `trending worker → backend snapshot API → backend out
 | Symptom | Meaning | Safe action |
 |---|---|---|
 | `GITHUB_TOKEN` configuration error | Token is absent or still a placeholder | Set a real token and rerun network-free validation |
-| Postgres verification failure | Production persistence cannot be trusted | Correct `DATABASE_URL`; do not use the development bypass |
-| No acquisition progress | Discovery returned nothing new, filtering rejected everything, or the database count did not advance | Inspect rejection and failure records before increasing limits |
-| `pending_persistence` is non-empty | Repositories still require enrichment/Postgres persistence | Rerun the same bounded corpus command |
-| `pending_index` is non-empty | Postgres succeeded but Qdrant indexing did not | Restore Qdrant, then rerun without `--no-index-qdrant` |
+| Backend verification failure | Authenticated repository delivery cannot be trusted | Correct `BACKEND_URL`/`INTERNAL_API_SECRET`; do not bypass delivery |
+| No acquisition progress | Discovery returned nothing new, filtering rejected everything, or the backend canonical count did not advance | Inspect rejection and failure records before increasing limits |
+| `pending_persistence` is non-empty | Repositories still require enrichment and backend delivery | Rerun the same bounded corpus command |
+| Legacy `pending_index` is non-empty | A pre-cutover checkpoint still records direct-index work | Do not write Qdrant directly; reconcile those repository IDs through backend ingestion/outbox and then retire the legacy checkpoint state |
 | Trending repository is missing in Qdrant | The backend outbox or ML refresh has not completed, or the repository has no approved corpus point | Inspect backend outbox/ML refresh state; let normal corpus acquisition approve missing repositories rather than writing Qdrant from the trending worker |
 | Unsupported embedding model | The embedding owner has not published a compatible model/dimension contract | Keep the current model until the shared embedding interface is updated |
 
@@ -125,3 +123,14 @@ uv run pytest -q
 ```
 
 Tests mock external services. A default test run must not contact GitHub, Postgres, Qdrant, or OpenRouter.
+
+Before handing a new corpus to online serving, confirm the backend outbox has
+completed repository embed/refresh jobs and authenticated V2 health reports an
+eligible count above `MIN_ELIGIBLE_REPOSITORIES`. Points missing the pinned
+embedding revision or required feature-spec version must be reindexed through
+the backend outbox; do not weaken production eligibility to accept them. The
+same validated reindex must stamp
+`serving_eligibility_version=repository-vector-v1` atomically with the vector;
+never backfill that marker with a payload-only patch. See the production
+runbook for the coordinated cutover and the limits of write-time vector
+certification.

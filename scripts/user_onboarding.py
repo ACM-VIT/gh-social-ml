@@ -7,11 +7,17 @@ import logging
 from collections.abc import Mapping
 from typing import Any
 
-from config import QDRANT_API_KEY, QDRANT_URL, REPOSITORY_EMBEDDING_MODEL
+from config import (
+    EMBEDDING_MODEL_REVISION,
+    QDRANT_API_KEY,
+    QDRANT_URL,
+    REPOSITORY_EMBEDDING_MODEL,
+)
 from embedding.embeddings import aggregate_vectors
 from embedding.repository_embedding import SUPPORTED_REPOSITORY_EMBEDDING_DIMS
 from embedding.user_profile_store import QdrantUserProfileStore
 from embedding.vector_contract import (
+    FEEDBACK_STATE_REVISION_FIELD,
     USER_PROFILE_COLLECTION_CONTRACT,
     canonical_backend_uuid,
     validate_embedding_vector,
@@ -31,10 +37,27 @@ _FEEDBACK_PAYLOAD_KEYS = {
     "feedback_adjustments",
     "feedback_applied_signals",
     "feedback_processed_events",
+    "feedback_rejections",
+    FEEDBACK_STATE_REVISION_FIELD,
     "last_feedback_version",
     "last_feedback_event_id",
+    "last_feedback_status",
     "preference_accumulator",
 }
+
+_EXPECTED_USER_NOT_SUPPLIED = object()
+
+
+class UserProfileWriteConflict(RuntimeError):
+    """The user snapshot changed before its conditional profile write."""
+
+
+def _is_feedback_payload_key(key: str) -> bool:
+    return (
+        key in _FEEDBACK_PAYLOAD_KEYS
+        or key.startswith("feedback_")
+        or key.startswith("last_feedback_")
+    )
 
 
 def _stored_vector(point: Any) -> list[float]:
@@ -60,7 +83,8 @@ def _has_feedback_state(payload: Mapping[str, Any]) -> bool:
     return any(
         key in payload
         and key not in {"last_feedback_version", "preference_accumulator"}
-        for key in _FEEDBACK_PAYLOAD_KEYS
+        for key in payload
+        if _is_feedback_payload_key(key)
     )
 
 
@@ -196,8 +220,16 @@ class UserOnboardingPipeline:
         payload: dict[str, Any] | None = None,
         qdrant_url: str | None = None,
         qdrant_api_key: str | None = None,
+        *,
+        expected_point: Any = _EXPECTED_USER_NOT_SUPPLIED,
     ) -> bool:
-        """Validate and persist one unnamed user vector using the shared contract."""
+        """Validate and conditionally persist one unnamed user vector.
+
+        When ``expected_point`` is supplied by the API, the write is fenced by
+        that exact profile revision and feedback cursor. Direct/offline callers
+        take one snapshot here and receive ``UserProfileWriteConflict`` if it
+        changes before the write.
+        """
         canonical_user_id = canonical_backend_uuid(user_id, field_name="user_id")
         validated = validate_embedding_vector(
             vector,
@@ -218,11 +250,14 @@ class UserOnboardingPipeline:
             api_key=qdrant_api_key or QDRANT_API_KEY,
         )
         active_store.ensure_collection()
-        existing = (
-            active_store.retrieve_user(canonical_user_id)
-            if hasattr(active_store, "retrieve_user")
-            else None
-        )
+        if expected_point is _EXPECTED_USER_NOT_SUPPLIED:
+            existing = (
+                active_store.retrieve_user(canonical_user_id)
+                if hasattr(active_store, "retrieve_user")
+                else None
+            )
+        else:
+            existing = expected_point
         existing_payload = copy.deepcopy(dict(existing.payload or {})) if existing else {}
         existing_profile_version = int(existing_payload.get("profile_version") or 0)
         requested_profile_version = int(user_payload.get("profile_version") or 0)
@@ -235,8 +270,8 @@ class UserOnboardingPipeline:
         stored_vector = normalized
         if existing and _has_feedback_state(existing_payload):
             stored_vector = _stored_vector(existing)
-            for key in _FEEDBACK_PAYLOAD_KEYS:
-                if key in existing_payload:
+            for key in existing_payload:
+                if _is_feedback_payload_key(key):
                     user_payload[key] = copy.deepcopy(existing_payload[key])
             # Keep the new profile baseline for a deliberate future replay or
             # reconciliation without replacing the live learned state.
@@ -250,15 +285,31 @@ class UserOnboardingPipeline:
                 "user_id": canonical_user_id,
                 "embedding_dim": VECTOR_DIMENSION,
                 "embedding_model": self.model_name,
+                "embedding_model_revision": EMBEDDING_MODEL_REVISION,
             }
         )
-        active_store.upsert_user(canonical_user_id, stored_vector, payload=user_payload)
-        if (
-            existing
-            and str(existing.id) != canonical_user_id
-            and hasattr(active_store, "delete_legacy_user")
-        ):
-            active_store.delete_legacy_user(canonical_user_id)
+        if hasattr(active_store, "compare_and_set_user"):
+            applied = active_store.compare_and_set_user(
+                canonical_user_id,
+                stored_vector,
+                payload=user_payload,
+                expected_point=existing,
+            )
+            if not applied:
+                raise UserProfileWriteConflict(
+                    "user profile or feedback state changed before storage"
+                )
+        else:
+            # Lightweight custom stores used by offline callers retain their
+            # old interface. Production Qdrant stores always take the CAS path.
+            active_store.upsert_user(
+                canonical_user_id,
+                stored_vector,
+                payload=user_payload,
+            )
+        # Do not migrate a legacy point online: Qdrant cannot atomically insert
+        # the canonical point and delete the legacy identity while feedback is
+        # active. A coordinated offline migration must own that operation.
         return True
 
     def onboard_user(

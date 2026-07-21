@@ -10,7 +10,7 @@ dependencies = [
     "numpy",
     "pg8000",
     "python-dotenv",
-    "qdrant-client",
+    "qdrant-client>=1.18.0,<2",
     "redis>=5.0.0",
     "requests",
     "schedule",

@@ -7,7 +7,11 @@ import pytest
 from qdrant_client.http import models
 
 from embedding.user_profile_store import QdrantUserProfileStore
-from embedding.vector_contract import USER_PROFILE_COLLECTION_CONTRACT, user_point_id
+from embedding.vector_contract import (
+    FEEDBACK_STATE_REVISION_FIELD,
+    USER_PROFILE_COLLECTION_CONTRACT,
+    user_point_id,
+)
 from scripts.user_onboarding import (
     EMBEDDING_MODEL,
     TARGET_VECTOR_NAME,
@@ -190,6 +194,11 @@ def test_profile_update_preserves_learned_vector_and_feedback_cursor():
                     "feedback_latent_vector": learned_latent,
                     "feedback_adjustments": {"repo": {"reaction": {"action": "like"}}},
                     "feedback_applied_signals": {"repo": ["readme_open"]},
+                    "feedback_rejections": [
+                        {"event_id": "rejected-event", "reason": "invalid"}
+                    ],
+                    FEEDBACK_STATE_REVISION_FIELD: 13,
+                    "last_feedback_status": "rejected",
                     "preference_accumulator": learned_latent,
                 },
             )
@@ -210,6 +219,11 @@ def test_profile_update_preserves_learned_vector_and_feedback_cursor():
     assert payload["last_feedback_version"] == 12
     assert payload["last_feedback_event_id"] == "event-12"
     assert payload["feedback_latent_vector"] == learned_latent
+    assert payload["feedback_rejections"] == [
+        {"event_id": "rejected-event", "reason": "invalid"}
+    ]
+    assert payload[FEEDBACK_STATE_REVISION_FIELD] == 13
+    assert payload["last_feedback_status"] == "rejected"
     assert payload["preference_accumulator"] == learned_latent
     assert payload["profile_baseline_vector"] == new_baseline
 

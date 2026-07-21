@@ -3,15 +3,20 @@ Description=GH Social ML API Service
 After=network-online.target docker.service
 Wants=network-online.target
 Requires=docker.service
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
+ExecStartPre=/usr/bin/docker run --rm --network none --no-healthcheck --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m -v /etc/gh-social/ml.env:/run/ml.env:ro -v /usr/local/lib/gh-social-ml/validate_production_config.py:/run/validate_production_config.py:ro gh-social-ml:current python /run/validate_production_config.py --env-file /run/ml.env
+ExecStartPre=/usr/bin/docker run --rm --network none --no-healthcheck --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m --env-file /etc/gh-social/ml.env -v /usr/local/lib/gh-social-ml/validate_production_config.py:/run/validate_production_config.py:ro gh-social-ml:current python /run/validate_production_config.py
 ExecStartPre=-/usr/bin/docker rm -f gh-social-ml
-ExecStart=/usr/bin/docker run --rm --name gh-social-ml --network host --env-file /etc/gh-social/ml.env gh-social-ml:current uvicorn api.main:app --host 127.0.0.1 --port 8000
+ExecStart=/usr/bin/docker run --rm --init --name gh-social-ml --network host --env-file /etc/gh-social/ml.env --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m --cap-drop ALL --security-opt no-new-privileges --pids-limit 512 --memory 2g --memory-swap 2g --cpus 2 --log-opt max-size=25m --log-opt max-file=5 gh-social-ml:current uvicorn api.main:app --host 127.0.0.1 --port 8000 --limit-concurrency 64 --backlog 128 --timeout-keep-alive 5
 ExecStop=/usr/bin/docker stop --time 30 gh-social-ml
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGTERM
+TimeoutStartSec=180
 TimeoutStopSec=30
 
 [Install]

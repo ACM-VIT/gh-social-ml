@@ -94,8 +94,11 @@ class FeedbackConsumer:
                     queue.task_done()
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                logger.exception("Development feedback consumer failed")
+            except Exception as exc:
+                logger.error(
+                    "Development feedback consumer failed error_type=%s",
+                    type(exc).__name__,
+                )
                 await asyncio.sleep(0.25)
 
     async def _redis_loop(self) -> None:
@@ -121,8 +124,11 @@ class FeedbackConsumer:
                         await self._process_message(str(message_id), payload)
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                logger.exception("Redis feedback consumer loop failed")
+            except Exception as exc:
+                logger.error(
+                    "Redis feedback consumer loop failed error_type=%s",
+                    type(exc).__name__,
+                )
                 await asyncio.sleep(1.0)
 
     async def _reclaim_stale(self) -> list[tuple[str, dict[str, str]]]:

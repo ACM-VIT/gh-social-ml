@@ -1,21 +1,37 @@
 name: Deploy to AWS
 
 on:
-  push:
-    branches:
-      - main
-      - master
+  workflow_run:
+    workflows: ["Test Trending Service"]
+    types: [completed]
+
+concurrency:
+  group: gh-social-ml-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
   deploy:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment:
+      name: production
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: '3.12'
 
@@ -24,51 +40,399 @@ jobs:
           python -m pip install uv==0.11.29
           uv sync --locked --dev
           uv run pytest -q
-          docker build -t gh-social-ml:${{ github.sha }} .
-          docker save gh-social-ml:${{ github.sha }} | gzip > gh-social-ml.tar.gz
+          docker build \
+            --build-arg ML_RELEASE_ID=${{ github.event.workflow_run.head_sha }} \
+            -t gh-social-ml:${{ github.event.workflow_run.head_sha }} .
+          docker save gh-social-ml:${{ github.event.workflow_run.head_sha }} | gzip > gh-social-ml.tar.gz
+          docker image inspect \
+            --format '{{.Size}}' \
+            gh-social-ml:${{ github.event.workflow_run.head_sha }} \
+            > deployment.image-size
+          sha256sum \
+            gh-social-ml.tar.gz \
+            deployment.image-size \
+            deploy/systemd/gh-social-ml.service \
+            deploy/systemd/gh-social-ml-feedback.service \
+            scripts/validate_production_config.py \
+            scripts/production_smoke.py \
+            > deployment.sha256
+
+      - name: Guard against stale workflow completion
+        id: release_guard
+        run: |
+          git fetch --no-tags origin main
+          if [ "$(git rev-parse origin/main)" = "${{ github.event.workflow_run.head_sha }}" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping stale tested commit; main has advanced."
+          fi
 
       - name: Upload immutable image and service units
-        uses: appleboy/scp-action@v1.0.0
+        if: steps.release_guard.outputs.current == 'true'
+        uses: appleboy/scp-action@ff85246acaad7bdce478db94a363cd2bf7c90345 # v1.0.0
         with:
           host: ${{ secrets.AWS_HOST }}
           username: ${{ secrets.AWS_USER }}
           key: ${{ secrets.AWS_PRIVATE_KEY }}
-          source: "gh-social-ml.tar.gz,deploy/systemd/*.service"
+          fingerprint: ${{ secrets.AWS_HOST_FINGERPRINT }}
+          timeout: 1m
+          command_timeout: 20m
+          source: "gh-social-ml.tar.gz,deployment.image-size,deployment.sha256,deploy/systemd/*.service,scripts/validate_production_config.py,scripts/production_smoke.py"
           target: /tmp/gh-social-ml-deploy
 
       - name: Deploy using SSH
-        uses: appleboy/ssh-action@v1.2.4
+        if: steps.release_guard.outputs.current == 'true'
+        uses: appleboy/ssh-action@823bd89e131d8d508129f9443cad5855e9ba96f0 # v1.2.4
         with:
           host: ${{ secrets.AWS_HOST }}
           username: ${{ secrets.AWS_USER }}
           key: ${{ secrets.AWS_PRIVATE_KEY }}
+          fingerprint: ${{ secrets.AWS_HOST_FINGERPRINT }}
+          timeout: 1m
+          command_timeout: 35m
           script: |
-            set -e
-            test -f /etc/gh-social/ml.env
-            if sudo docker image inspect gh-social-ml:current >/dev/null 2>&1; then
-              sudo docker tag gh-social-ml:current gh-social-ml:previous
+            /usr/bin/env bash <<'GH_SOCIAL_DEPLOY'
+            set -Eeuo pipefail
+            release_sha='${{ github.event.workflow_run.head_sha }}'
+            transaction_id="${release_sha}-${{ github.run_id }}-${{ github.run_attempt }}"
+            staging_dir=/tmp/gh-social-ml-deploy
+            archive_path="$staging_dir/gh-social-ml.tar.gz"
+            image_ref="gh-social-ml:$release_sha"
+            rollback_image="gh-social-ml:rollback-$transaction_id"
+            library_root=/usr/local/lib/gh-social-ml
+            candidate_helper_dir="$library_root/releases/$release_sha"
+            transaction_dir="$library_root/transactions/$transaction_id"
+            validator_path="$library_root/validate_production_config.py"
+            smoke_path="$library_root/production_smoke.py"
+            api_unit=/etc/systemd/system/gh-social-ml.service
+            feedback_unit=/etc/systemd/system/gh-social-ml-feedback.service
+
+            sudo() {
+              command /usr/bin/sudo -n "$@"
+            }
+
+            sudo test -f /etc/gh-social/ml.env
+            sudo test -r /etc/gh-social/ml.env
+            if [ "$(sudo stat -c '%u' /etc/gh-social/ml.env)" != "0" ]; then
+              echo "/etc/gh-social/ml.env must be owned by root" >&2
+              exit 1
             fi
-            sudo docker load -i /tmp/gh-social-ml-deploy/gh-social-ml.tar.gz
-            sudo docker tag gh-social-ml:${{ github.sha }} gh-social-ml:current
-            sudo cp /tmp/gh-social-ml-deploy/deploy/systemd/gh-social-ml.service /etc/systemd/system/gh-social-ml.service
-            sudo cp /tmp/gh-social-ml-deploy/deploy/systemd/gh-social-ml-feedback.service /etc/systemd/system/gh-social-ml-feedback.service
+            ml_env_mode=$(sudo stat -c '%a' /etc/gh-social/ml.env)
+            case "$ml_env_mode" in
+              400|600) ;;
+              *)
+                echo "/etc/gh-social/ml.env must be root-only (mode 400 or 600)" >&2
+                exit 1
+                ;;
+            esac
+
+            deploy_uid=$(id -u)
+            test ! -L "$staging_dir"
+            test "$(stat -c '%u' "$staging_dir")" = "$deploy_uid"
+            if [ -n "$(find "$staging_dir" -maxdepth 0 -perm /022 -print -quit)" ]; then
+              echo "$staging_dir must not be group- or world-writable" >&2
+              exit 1
+            fi
+            for artifact in \
+              "$archive_path" \
+              "$staging_dir/deployment.image-size" \
+              "$staging_dir/deployment.sha256" \
+              "$staging_dir/deploy/systemd/gh-social-ml.service" \
+              "$staging_dir/deploy/systemd/gh-social-ml-feedback.service" \
+              "$staging_dir/scripts/validate_production_config.py" \
+              "$staging_dir/scripts/production_smoke.py"
+            do
+              test -f "$artifact"
+              test ! -L "$artifact"
+              test "$(stat -c '%u' "$artifact")" = "$deploy_uid"
+              if [ -n "$(find "$artifact" -maxdepth 0 -perm /022 -print -quit)" ]; then
+                echo "$artifact must not be group- or world-writable" >&2
+                exit 1
+              fi
+            done
+
+            test -s "$archive_path"
+            test -s "$staging_dir/deployment.image-size"
+            test -s "$staging_dir/deployment.sha256"
+            (cd "$staging_dir" && sha256sum --check deployment.sha256)
+            archive_bytes=$(stat -c '%s' "$archive_path")
+            image_bytes=$(tr -d '\n' < "$staging_dir/deployment.image-size")
+            case "$image_bytes" in
+              ''|*[!0-9]*)
+                echo "Candidate image size metadata is invalid" >&2
+                exit 1
+                ;;
+            esac
+            docker_root=$(sudo docker info --format '{{.DockerRootDir}}')
+            sudo test -d "$docker_root"
+            docker_available_bytes=$(sudo df -PB1 "$docker_root" | awk 'NR == 2 {print $4}')
+            case "$docker_available_bytes" in
+              ''|*[!0-9]*)
+                echo "Could not determine available space for Docker root $docker_root" >&2
+                exit 1
+                ;;
+            esac
+            estimated_image_bytes=$((archive_bytes * 3))
+            if [ "$image_bytes" -gt "$estimated_image_bytes" ]; then
+              estimated_image_bytes=$image_bytes
+            fi
+            required_docker_bytes=$((estimated_image_bytes + 2147483648))
+            if [ "$docker_available_bytes" -lt "$required_docker_bytes" ]; then
+              echo "Insufficient Docker disk: need at least $required_docker_bytes bytes free, have $docker_available_bytes" >&2
+              exit 1
+            fi
+
+            sudo docker load -i "$archive_path"
+            sudo docker image inspect "$image_ref" >/dev/null
+
+            sudo install -d -m 0755 "$library_root" "$library_root/releases"
+            sudo install -d -m 0755 "$candidate_helper_dir"
+            sudo install -m 0644 "$staging_dir/scripts/validate_production_config.py" "$candidate_helper_dir/validate_production_config.py"
+            sudo install -m 0644 "$staging_dir/scripts/production_smoke.py" "$candidate_helper_dir/production_smoke.py"
+
+            sudo docker run --rm --network none --no-healthcheck --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+              -v "$candidate_helper_dir/validate_production_config.py":/run/validate_production_config.py:ro \
+              -v /etc/gh-social/ml.env:/run/ml.env:ro \
+              "$image_ref" \
+              python /run/validate_production_config.py --env-file /run/ml.env
+            sudo docker run --rm --network none --no-healthcheck --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+              --env-file /etc/gh-social/ml.env \
+              -v "$candidate_helper_dir/validate_production_config.py":/run/validate_production_config.py:ro \
+              "$image_ref" \
+              python /run/validate_production_config.py
+
+            sudo docker run --rm --network host --no-healthcheck --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+              --env-file /etc/gh-social/ml.env \
+              "$image_ref" \
+              python -m scripts.bootstrap_qdrant
+
+            run_smoke() {
+              sudo docker exec -i gh-social-ml python - "$@" < "$smoke_path"
+            }
+
+            wait_for_health() {
+              for attempt in $(seq 1 24); do
+                if run_smoke --health-only --timeout 8; then
+                  return 0
+                fi
+                sleep 5
+              done
+              return 1
+            }
+
+            restore_file() {
+              target=$1
+              backup_name=$2
+              existed=$3
+              if [ "$existed" = "true" ]; then
+                sudo cp -a --no-dereference "$transaction_dir/$backup_name" "$target.restore-$transaction_id"
+                sudo mv -Tf "$target.restore-$transaction_id" "$target"
+                sudo test -e "$target" || sudo test -L "$target"
+              else
+                sudo unlink "$target" >/dev/null 2>&1 || true
+                if sudo test -e "$target" || sudo test -L "$target"; then
+                  return 1
+                fi
+              fi
+            }
+
+            restore_enablement() {
+              unit=$1
+              was_enabled=$2
+              if [ "$was_enabled" = "true" ]; then
+                sudo systemctl enable "$unit" >/dev/null
+                sudo systemctl is-enabled --quiet "$unit"
+              else
+                sudo systemctl disable "$unit" >/dev/null 2>&1 || true
+                if sudo systemctl is-enabled --quiet "$unit"; then
+                  return 1
+                fi
+              fi
+            }
+
+            restore_activity() {
+              unit=$1
+              was_active=$2
+              if [ "$was_active" = "true" ]; then
+                sudo systemctl restart "$unit"
+                sudo systemctl is-active --quiet "$unit"
+              else
+                sudo systemctl stop "$unit" >/dev/null 2>&1 || true
+                if sudo systemctl is-active --quiet "$unit"; then
+                  return 1
+                fi
+              fi
+            }
+
+            mutation_started=false
+            had_validator=false
+            had_smoke=false
+            had_api_unit=false
+            had_feedback_unit=false
+            had_current=false
+            api_was_enabled=false
+            feedback_was_enabled=false
+            api_was_active=false
+            feedback_was_active=false
+
+            sudo install -d -m 0700 "$library_root/transactions" "$transaction_dir"
+            if sudo test -e "$validator_path" || sudo test -L "$validator_path"; then
+              sudo cp -a --no-dereference "$validator_path" "$transaction_dir/validate_production_config.py"
+              had_validator=true
+            fi
+            if sudo test -e "$smoke_path" || sudo test -L "$smoke_path"; then
+              sudo cp -a --no-dereference "$smoke_path" "$transaction_dir/production_smoke.py"
+              had_smoke=true
+            fi
+            if sudo test -e "$api_unit" || sudo test -L "$api_unit"; then
+              sudo cp -a --no-dereference "$api_unit" "$transaction_dir/gh-social-ml.service"
+              had_api_unit=true
+            fi
+            if sudo test -e "$feedback_unit" || sudo test -L "$feedback_unit"; then
+              sudo cp -a --no-dereference "$feedback_unit" "$transaction_dir/gh-social-ml-feedback.service"
+              had_feedback_unit=true
+            fi
+            if sudo docker image inspect gh-social-ml:current >/dev/null 2>&1; then
+              had_current=true
+            fi
+            if [ "$had_current" = "true" ]; then
+              if [ "$had_validator" != "true" ] || [ "$had_smoke" != "true" ] || \
+                 [ "$had_api_unit" != "true" ] || [ "$had_feedback_unit" != "true" ]; then
+                echo "Existing current release is incomplete; refusing a deployment without a verifiable rollback set" >&2
+                exit 1
+              fi
+              sudo test -r "$validator_path"
+              sudo test -r "$smoke_path"
+              sudo docker tag gh-social-ml:current "$rollback_image"
+            fi
+            if sudo systemctl is-enabled --quiet gh-social-ml; then api_was_enabled=true; fi
+            if sudo systemctl is-enabled --quiet gh-social-ml-feedback; then feedback_was_enabled=true; fi
+            if sudo systemctl is-active --quiet gh-social-ml; then api_was_active=true; fi
+            if sudo systemctl is-active --quiet gh-social-ml-feedback; then feedback_was_active=true; fi
+
+            deployment_failed() {
+              failure_status=$1
+              failure_line=$2
+              trap - ERR EXIT HUP INT TERM
+              set +e
+              echo "Deployment failed at remote script line $failure_line; restoring the prior release transaction" >&2
+              if [ "$mutation_started" = "true" ]; then
+                rollback_restored=true
+                restore_file "$validator_path" validate_production_config.py "$had_validator" || rollback_restored=false
+                restore_file "$smoke_path" production_smoke.py "$had_smoke" || rollback_restored=false
+                restore_file "$api_unit" gh-social-ml.service "$had_api_unit" || rollback_restored=false
+                restore_file "$feedback_unit" gh-social-ml-feedback.service "$had_feedback_unit" || rollback_restored=false
+
+                if [ "$had_current" = "true" ]; then
+                  sudo docker tag "$rollback_image" gh-social-ml:current || rollback_restored=false
+                else
+                  sudo docker image rm gh-social-ml:current >/dev/null 2>&1 || true
+                  if sudo docker image inspect gh-social-ml:current >/dev/null 2>&1; then
+                    rollback_restored=false
+                  fi
+                fi
+
+                sudo systemctl daemon-reload || rollback_restored=false
+                restore_enablement gh-social-ml "$api_was_enabled" || rollback_restored=false
+                restore_enablement gh-social-ml-feedback "$feedback_was_enabled" || rollback_restored=false
+                restore_activity gh-social-ml-feedback "$feedback_was_active" || rollback_restored=false
+                restore_activity gh-social-ml "$api_was_active" || rollback_restored=false
+                sudo unlink "$validator_path.new-$transaction_id" >/dev/null 2>&1 || true
+                sudo unlink "$smoke_path.new-$transaction_id" >/dev/null 2>&1 || true
+                sudo unlink "$api_unit.new-$transaction_id" >/dev/null 2>&1 || true
+                sudo unlink "$feedback_unit.new-$transaction_id" >/dev/null 2>&1 || true
+                sudo unlink "$validator_path.restore-$transaction_id" >/dev/null 2>&1 || true
+                sudo unlink "$smoke_path.restore-$transaction_id" >/dev/null 2>&1 || true
+                sudo unlink "$api_unit.restore-$transaction_id" >/dev/null 2>&1 || true
+                sudo unlink "$feedback_unit.restore-$transaction_id" >/dev/null 2>&1 || true
+
+                rollback_verified=false
+                if [ "$rollback_restored" = "true" ] && [ "$had_current" = "true" ] && [ "$api_was_active" = "true" ]; then
+                  if wait_for_health && run_smoke --timeout 10; then
+                    rollback_verified=true
+                  fi
+                fi
+                if [ "$rollback_verified" = "true" ]; then
+                  echo "Forward deployment failed; the complete prior release was restored and verified" >&2
+                else
+                  echo "CRITICAL: rollback could not pass authenticated V2 health and recommendation verification" >&2
+                fi
+              fi
+              sudo journalctl -u gh-social-ml-feedback -u gh-social-ml -n 200 --no-pager || true
+              exit "$failure_status"
+            }
+
+            deployment_exited() {
+              failure_status=$1
+              failure_line=$2
+              if [ "$mutation_started" = "true" ]; then
+                if [ "$failure_status" -eq 0 ]; then
+                  failure_status=1
+                fi
+                deployment_failed "$failure_status" "$failure_line"
+              fi
+            }
+
+            trap 'deployment_failed "$?" "$LINENO"' ERR
+            trap 'deployment_exited "$?" "$LINENO"' EXIT
+            trap 'deployment_failed 129 "$LINENO"' HUP
+            trap 'deployment_failed 130 "$LINENO"' INT TERM
+            mutation_started=true
+
+            sudo install -m 0644 "$candidate_helper_dir/validate_production_config.py" "$validator_path.new-$transaction_id"
+            sudo mv -Tf "$validator_path.new-$transaction_id" "$validator_path"
+            sudo install -m 0644 "$candidate_helper_dir/production_smoke.py" "$smoke_path.new-$transaction_id"
+            sudo mv -Tf "$smoke_path.new-$transaction_id" "$smoke_path"
+            sudo docker tag "$image_ref" gh-social-ml:current
+            sudo install -m 0644 "$staging_dir/deploy/systemd/gh-social-ml.service" "$api_unit.new-$transaction_id"
+            sudo mv -Tf "$api_unit.new-$transaction_id" "$api_unit"
+            sudo install -m 0644 "$staging_dir/deploy/systemd/gh-social-ml-feedback.service" "$feedback_unit.new-$transaction_id"
+            sudo mv -Tf "$feedback_unit.new-$transaction_id" "$feedback_unit"
             sudo systemctl daemon-reload
             sudo systemctl enable gh-social-ml
             sudo systemctl enable gh-social-ml-feedback
             sudo systemctl restart gh-social-ml-feedback
             sudo systemctl restart gh-social-ml
-            healthy=false
-            for attempt in $(seq 1 24); do
-              if sudo docker exec gh-social-ml python -c "import os, requests; response=requests.get('http://127.0.0.1:8000/api/v2/health', headers={'x-internal-secret': os.environ['INTERNAL_API_SECRET']}, timeout=15); response.raise_for_status()"; then
-                healthy=true
-                break
-              fi
-              sleep 5
-            done
-            if ! $healthy; then
-              if sudo docker image inspect gh-social-ml:previous >/dev/null 2>&1; then
-                sudo docker tag gh-social-ml:previous gh-social-ml:current
-                sudo systemctl restart gh-social-ml-feedback gh-social-ml
-              fi
-              exit 1
+
+            if wait_for_health && run_smoke --timeout 10; then
+              echo "Forward release passed smoke verification"
+            else
+              false
             fi
+
+            if [ "$had_current" = "true" ]; then
+              sudo docker tag "$rollback_image" gh-social-ml:previous
+            fi
+
+            trap - ERR EXIT HUP INT TERM
+            mutation_started=false
+            sudo docker image rm "$rollback_image" >/dev/null 2>&1 || true
+
+            prune_old_release_tags() {
+              keep_count=5
+              release_entries=()
+              while IFS= read -r tag; do
+                if [[ "$tag" =~ ^[0-9a-f]{40}$ ]]; then
+                  created=$(sudo docker image inspect --format '{{.Created}}' "gh-social-ml:$tag" 2>/dev/null) || continue
+                  release_entries+=("$created $tag")
+                fi
+              done < <(sudo docker image ls gh-social-ml --format '{{.Tag}}' | sort -u)
+
+              if [ "${#release_entries[@]}" -le "$keep_count" ]; then
+                return 0
+              fi
+              mapfile -t release_entries < <(printf '%s\n' "${release_entries[@]}" | sort -r)
+              for ((index=keep_count; index<${#release_entries[@]}; index++)); do
+                tag=${release_entries[$index]##* }
+                if [ "$tag" = "$release_sha" ]; then
+                  continue
+                fi
+                sudo docker image rm "gh-social-ml:$tag" >/dev/null 2>&1 || \
+                  echo "Warning: could not remove retained release tag gh-social-ml:$tag" >&2
+              done
+            }
+            prune_old_release_tags
+
+            echo "Deployment passed authenticated V2 health, consumer, model, corpus, and recommendation smoke checks"
+            GH_SOCIAL_DEPLOY

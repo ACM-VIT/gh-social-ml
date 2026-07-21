@@ -32,9 +32,14 @@ class TextChunk:
 class SentenceTransformerEmbedder:
     """Lazy sentence-transformers wrapper used by repository embedding stages."""
 
-    def __init__(self, model_name: str = REPOSITORY_EMBEDDING_MODEL) -> None:
+    def __init__(
+        self,
+        model_name: str = REPOSITORY_EMBEDDING_MODEL,
+        *,
+        model: object | None = None,
+    ) -> None:
         self.model_name = model_name
-        self._model = None
+        self._model = model
 
     @property
     def model(self):

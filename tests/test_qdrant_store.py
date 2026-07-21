@@ -7,8 +7,15 @@ from qdrant_client.http import models
 
 from config import QDRANT_PAYLOAD_INDEX_FIELDS
 from embedding.qdrant_store import QdrantRepositoryStore
+from embedding.repository_embedding import (
+    RepositoryEmbeddingConfig,
+    RepositoryEmbeddingResult,
+    build_vector_payload,
+)
 from embedding.vector_contract import (
     REPOSITORY_DISCOVERY_CHANNELS,
+    REPOSITORY_SERVING_ELIGIBILITY_FIELD,
+    REPOSITORY_SERVING_ELIGIBILITY_VERSION,
     repository_point_id,
 )
 
@@ -65,6 +72,7 @@ class FakeQdrantClient:
         self.scroll_response = []
         self.retrieve_response = []
         self.fail_index = None
+        self.upsert_kwargs = None
 
     def collection_exists(self, collection_name):
         return self.exists
@@ -97,6 +105,9 @@ class FakeQdrantClient:
         self.retrieve_kwargs = kwargs
         return self.retrieve_response
 
+    def upsert(self, **kwargs):
+        self.upsert_kwargs = kwargs
+
 
 def _store(client, **overrides):
     return QdrantRepositoryStore(client=client, **overrides)
@@ -120,11 +131,77 @@ def test_ensure_collection_creates_and_validates_schema_and_all_indexes():
     assert schemas["star_count"] == models.PayloadSchemaType.INTEGER
     assert schemas["pushed_days_ago"] == models.PayloadSchemaType.INTEGER
     assert schemas["content_version"] == models.PayloadSchemaType.INTEGER
+    assert (
+        schemas[REPOSITORY_SERVING_ELIGIBILITY_FIELD]
+        == models.PayloadSchemaType.KEYWORD
+    )
     assert schemas["trend_velocity"] == models.PayloadSchemaType.FLOAT
     assert schemas["activity_score"] == models.PayloadSchemaType.FLOAT
     assert schemas["doc_quality"] == models.PayloadSchemaType.FLOAT
     assert schemas["code_health"] == models.PayloadSchemaType.FLOAT
     assert schemas["pushed_at"] == models.PayloadSchemaType.DATETIME
+
+
+def _embedding_result() -> RepositoryEmbeddingResult:
+    vector = _vector()
+    config = RepositoryEmbeddingConfig()
+    payload = build_vector_payload(
+        {
+            "repo_id": REPO_ID,
+            "full_name": "owner/repository",
+            "description": "validated repository",
+            "primary_language": "Python",
+            "languages": ["Python"],
+            "topics": ["vectors"],
+        },
+        repo_id=REPO_ID,
+        final_embedding=vector,
+        readme_chunks=1,
+        source_hash="source-hash",
+        config=config,
+    )
+    return RepositoryEmbeddingResult(
+        repo_id=REPO_ID,
+        final_embedding=vector,
+        readme_embedding=vector,
+        metadata_embedding=vector,
+        topic_embedding=vector,
+        payload=payload,
+        readme_chunks=1,
+        source_hash="source-hash",
+        embedding_model=config.model_name,
+        embedding_version=config.version,
+    )
+
+
+def test_upsert_stamps_serving_eligibility_only_with_validated_vector() -> None:
+    client = FakeQdrantClient()
+    result = _embedding_result()
+    assert REPOSITORY_SERVING_ELIGIBILITY_FIELD not in result.payload
+
+    _store(client).upsert([result])
+
+    assert client.upsert_kwargs["wait"] is True
+    stored = client.upsert_kwargs["points"][0]
+    assert stored.vector[VECTOR_NAME] == _vector()
+    assert (
+        stored.payload[REPOSITORY_SERVING_ELIGIBILITY_FIELD]
+        == REPOSITORY_SERVING_ELIGIBILITY_VERSION
+    )
+    assert REPOSITORY_SERVING_ELIGIBILITY_FIELD not in result.payload
+
+
+def test_upsert_rejects_a_caller_supplied_serving_marker() -> None:
+    client = FakeQdrantClient()
+    result = _embedding_result()
+    result.payload[REPOSITORY_SERVING_ELIGIBILITY_FIELD] = (
+        REPOSITORY_SERVING_ELIGIBILITY_VERSION
+    )
+
+    with pytest.raises(ValueError, match="only be stamped"):
+        _store(client).upsert([result])
+
+    assert client.upsert_kwargs is None
 
 
 @pytest.mark.parametrize(

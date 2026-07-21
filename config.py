@@ -1,9 +1,26 @@
+import hmac
 import os
 
 
 def internal_api_header_name() -> str:
     """Return the normalized service-auth header shared by every API layer."""
     return os.getenv("INTERNAL_API_HEADER", "x-internal-secret").strip().lower() or "x-internal-secret"
+
+
+def constant_time_secret_matches(supplied: str | None, expected: str) -> bool:
+    """Compare service credentials without str-only compare_digest failures.
+
+    ``hmac.compare_digest`` rejects non-ASCII ``str`` values.  Comparing UTF-8
+    bytes keeps authentication fail-closed for malformed headers and avoids a
+    request-triggered ``TypeError``.
+    """
+
+    if not supplied:
+        return False
+    try:
+        return hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
+    except (AttributeError, UnicodeEncodeError):
+        return False
 
 
 def _positive_int_env(name: str, default: int) -> int:
@@ -40,10 +57,12 @@ def _non_negative_int_env(name: str, default: int) -> int:
 NOVELTY_THRESHOLD               = 0.35
 TOP_K_COMPARISONS               = 5
 EMBEDDING_MODEL                 = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-EMBEDDING_DIM                   = 384
+EMBEDDING_DIM                   = _positive_int_env("VECTOR_DIMENSION", 384)
 COLLECTION_NAME                 = "osiris_research_corpus"
-QDRANT_VECTOR_NAME              = "repo_embedding"
-USER_PROFILES_COLLECTION_NAME   = "user_profiles"
+QDRANT_VECTOR_NAME              = os.getenv("QDRANT_VECTOR_NAME", "repo_embedding")
+USER_PROFILES_COLLECTION_NAME   = os.getenv(
+    "USER_PROFILES_COLLECTION", "user_profiles"
+)
 MAX_DOC_SCORE                   = 100
 GATE_APPROVAL_THRESHOLD         = 0.60
 MIN_STARS_PREFILTER             = 50
@@ -75,6 +94,17 @@ NOVELTY_WEIGHTS = {
 REPOSITORY_EMBEDDING_MODEL = EMBEDDING_MODEL
 REPOSITORY_EMBEDDING_DIM = EMBEDDING_DIM
 REPOSITORY_EMBEDDING_VERSION = os.getenv("REPOSITORY_EMBEDDING_VERSION", "repo-embedding-v1")
+REPOSITORY_FEATURE_SPEC_VERSION = os.getenv(
+    "REPOSITORY_FEATURE_SPEC_VERSION", "v1"
+).strip()
+if not REPOSITORY_FEATURE_SPEC_VERSION:
+    raise ValueError("REPOSITORY_FEATURE_SPEC_VERSION must be non-empty")
+EMBEDDING_MODEL_REVISION = os.getenv(
+    "EMBEDDING_MODEL_REVISION",
+    "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+).strip()
+if not EMBEDDING_MODEL_REVISION:
+    raise ValueError("EMBEDDING_MODEL_REVISION must be a non-empty immutable revision")
 README_CHUNK_CHARS = _positive_int_env("README_CHUNK_CHARS", 2500)
 README_CHUNK_OVERLAP_CHARS = _non_negative_int_env("README_CHUNK_OVERLAP_CHARS", 250)
 if README_CHUNK_OVERLAP_CHARS >= README_CHUNK_CHARS:
@@ -95,22 +125,30 @@ QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY") or None
 QDRANT_COLLECTION_NAME = os.getenv("QDRANT_COLLECTION_NAME", COLLECTION_NAME)
 QDRANT_DISTANCE = os.getenv("QDRANT_DISTANCE", "Cosine")
-QDRANT_PAYLOAD_INDEX_FIELDS = [
-    "repo_id",
-    "primary_language",
-    "category",
-    "discovery_category",
-    "discovery_band",
-    "star_count",
-    "trend_velocity",
-    "activity_score",
-    "doc_quality",
-    "code_health",
-    "pushed_days_ago",
-    "content_version",
-    "updated_at",
-    "pushed_at",
-]
+QDRANT_PAYLOAD_INDEX_SCHEMA = {
+    "repo_id": "keyword",
+    "serving_eligibility_version": "keyword",
+    "embedding_model": "keyword",
+    "embedding_model_revision": "keyword",
+    "embedding_version": "keyword",
+    "embedding_dim": "integer",
+    "feature_spec_version": "keyword",
+    "model_version": "keyword",
+    "primary_language": "keyword",
+    "category": "keyword",
+    "discovery_category": "keyword",
+    "discovery_band": "keyword",
+    "star_count": "integer",
+    "trend_velocity": "float",
+    "activity_score": "float",
+    "doc_quality": "float",
+    "code_health": "float",
+    "pushed_days_ago": "integer",
+    "content_version": "integer",
+    "updated_at": "datetime",
+    "pushed_at": "datetime",
+}
+QDRANT_PAYLOAD_INDEX_FIELDS = list(QDRANT_PAYLOAD_INDEX_SCHEMA)
 
 # ── Dwell-time signal configuration ──────────────────────────────────────────
 # These constants control how observed dwell time on a repository card is

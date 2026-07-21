@@ -1,7 +1,11 @@
 import json
+import hashlib
 import logging
+import math
 import os
 from collections.abc import Iterable
+from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -21,6 +25,7 @@ from config import REPOSITORY_EMBEDDING_VERSION
 
 logger = logging.getLogger("pipeline.ranker")
 STANDARDIZED_FEATURE_CLIP = 8.0
+_SHA256_HEX_LENGTH = 64
 
 class MMoEHeavyRanker(nn.Module):
     def __init__(self, input_dim, num_experts=4):
@@ -103,6 +108,10 @@ class RankerService:
         emb_dim=384,
         manifest_path=None,
         expected_embedding_version=None,
+        expected_embedding_versions=None,
+        expected_embedding_model=None,
+        expected_embedding_model_revision=None,
+        require_production_manifest=False,
     ):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.emb_dim = EMBEDDING_DIM
@@ -110,6 +119,13 @@ class RankerService:
         self.embedding_version = REPOSITORY_EMBEDDING_VERSION
         self.compatible_embedding_versions = {self.embedding_version}
         self.feature_spec_version = FEATURE_SPEC_VERSION
+        self.embedding_model: str | None = None
+        self.embedding_model_revision: str | None = None
+        self.production_qualified = False
+        self.qualification_errors: tuple[str, ...] = (
+            "model manifest is unavailable",
+        )
+        self.manifest: dict = {}
         
         # Total input dim = User_emb(384) + Repo_emb(384) + DenseFeatures(10)
         self.input_dim = INPUT_DIM
@@ -122,6 +138,9 @@ class RankerService:
         if os.path.exists(manifest_path):
             with open(manifest_path, "r", encoding="utf-8") as manifest_file:
                 manifest = json.load(manifest_file)
+            if not isinstance(manifest, dict):
+                raise ValueError("Model manifest must be a JSON object")
+            self.manifest = manifest
             expected_contract = {
                 "input_dim": INPUT_DIM,
                 "embedding_dim": EMBEDDING_DIM,
@@ -144,6 +163,14 @@ class RankerService:
                 manifest.get("embedding_version")
                 or REPOSITORY_EMBEDDING_VERSION
             )
+            raw_embedding_model = manifest.get("embedding_model")
+            if raw_embedding_model is not None:
+                self.embedding_model = str(raw_embedding_model).strip() or None
+            raw_embedding_revision = manifest.get("embedding_model_revision")
+            if raw_embedding_revision is not None:
+                self.embedding_model_revision = (
+                    str(raw_embedding_revision).strip() or None
+                )
             raw_compatible_versions = manifest.get("compatible_embedding_versions")
             if raw_compatible_versions is None:
                 raw_compatible_versions = [self.embedding_version]
@@ -162,16 +189,36 @@ class RankerService:
             self.compatible_embedding_versions = {
                 version.strip() for version in raw_compatible_versions
             }
+            self.qualification_errors = tuple(
+                self._production_manifest_errors(
+                    manifest,
+                    model_path=Path(model_path),
+                    scaler_path=Path(scaler_path),
+                    expected_embedding_model=expected_embedding_model,
+                    expected_embedding_model_revision=expected_embedding_model_revision,
+                )
+            )
+            self.production_qualified = not self.qualification_errors
             logger.info("Model manifest loaded successfully from %s", manifest_path)
 
-        if (
-            expected_embedding_version
-            and expected_embedding_version not in self.compatible_embedding_versions
-        ):
+        requested_embedding_versions = set(expected_embedding_versions or ())
+        if expected_embedding_version:
+            requested_embedding_versions.add(expected_embedding_version)
+        incompatible_versions = (
+            requested_embedding_versions - self.compatible_embedding_versions
+        )
+        if incompatible_versions:
             raise ValueError(
                 "Heavy ranker embedding contract is incompatible with serving: "
-                f"expected {expected_embedding_version!r}, compatible versions are "
+                f"expected {sorted(requested_embedding_versions)!r}, "
+                "incompatible versions are "
+                f"{sorted(incompatible_versions)!r}, compatible versions are "
                 f"{sorted(self.compatible_embedding_versions)!r}"
+            )
+        if require_production_manifest and not self.production_qualified:
+            raise RuntimeError(
+                "Heavy ranker manifest is not production-qualified: "
+                + "; ".join(self.qualification_errors)
             )
         
         # Load Model
@@ -210,6 +257,141 @@ class RankerService:
             logger.info("Feature scaler loaded successfully from %s", scaler_path)
         else:
             raise RuntimeError(f"{scaler_path} not found; refusing to use unscaled features")
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as artifact:
+            for block in iter(lambda: artifact.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    @classmethod
+    def _production_manifest_errors(
+        cls,
+        manifest: dict,
+        *,
+        model_path: Path,
+        scaler_path: Path,
+        expected_embedding_model: str | None,
+        expected_embedding_model_revision: str | None,
+    ) -> list[str]:
+        """Return bounded, non-secret production qualification failures.
+
+        Loading an artifact and qualifying it for broad production traffic are
+        intentionally separate.  Development can inspect older artifacts,
+        while serving keeps them disabled until provenance, evaluation, and
+        calibration are all explicit and verifiable.
+        """
+        errors: list[str] = []
+
+        def non_empty_string(key: str) -> str | None:
+            value = manifest.get(key)
+            if not isinstance(value, str) or not value.strip():
+                errors.append(f"missing or invalid {key}")
+                return None
+            return value.strip()
+
+        model_file = non_empty_string("model_file")
+        scaler_file = non_empty_string("scaler_file")
+        non_empty_string("model_version")
+        non_empty_string("embedding_version")
+        model_hash = non_empty_string("model_sha256")
+        scaler_hash = non_empty_string("scaler_sha256")
+        embedding_model = non_empty_string("embedding_model")
+        embedding_revision = non_empty_string("embedding_model_revision")
+        non_empty_string("value_function_version")
+        non_empty_string("code_version")
+
+        if model_file is not None and model_file != model_path.name:
+            errors.append("model_file does not match the loaded model artifact")
+        if scaler_file is not None and scaler_file != scaler_path.name:
+            errors.append("scaler_file does not match the loaded scaler artifact")
+
+        compatible_versions = manifest.get("compatible_embedding_versions")
+        if (
+            not isinstance(compatible_versions, list)
+            or not compatible_versions
+            or any(
+                not isinstance(version, str) or not version.strip()
+                for version in compatible_versions
+            )
+        ):
+            errors.append("missing or invalid compatible_embedding_versions")
+
+        if model_hash is not None:
+            normalized = model_hash.casefold()
+            if (
+                len(normalized) != _SHA256_HEX_LENGTH
+                or any(character not in "0123456789abcdef" for character in normalized)
+            ):
+                errors.append("model_sha256 must be a 64-character hex digest")
+            elif not model_path.is_file() or cls._sha256(model_path) != normalized:
+                errors.append("model_sha256 does not match the model artifact")
+        if scaler_hash is not None:
+            normalized = scaler_hash.casefold()
+            if (
+                len(normalized) != _SHA256_HEX_LENGTH
+                or any(character not in "0123456789abcdef" for character in normalized)
+            ):
+                errors.append("scaler_sha256 must be a 64-character hex digest")
+            elif not scaler_path.is_file() or cls._sha256(scaler_path) != normalized:
+                errors.append("scaler_sha256 does not match the scaler artifact")
+
+        if expected_embedding_model and embedding_model != expected_embedding_model:
+            errors.append("embedding_model does not match the serving contract")
+        if (
+            expected_embedding_model_revision
+            and embedding_revision != expected_embedding_model_revision
+        ):
+            errors.append(
+                "embedding_model_revision does not match the serving contract"
+            )
+
+        weights = manifest.get("value_weights")
+        if weights != VALUE_WEIGHTS:
+            errors.append("value_weights do not match the serving value function")
+
+        training_data = manifest.get("training_data")
+        if not isinstance(training_data, dict):
+            errors.append("missing or invalid training_data")
+        else:
+            identity = training_data.get("identity")
+            data_type = training_data.get("type")
+            if not isinstance(identity, str) or not identity.strip():
+                errors.append("missing or invalid training_data.identity")
+            if not isinstance(data_type, str) or not data_type.strip():
+                errors.append("missing or invalid training_data.type")
+            elif "synthetic" in data_type.casefold():
+                errors.append("synthetic training data is not production-qualified")
+
+        raw_training_timestamp = manifest.get("training_timestamp")
+        if not isinstance(raw_training_timestamp, str):
+            errors.append("missing or invalid training_timestamp")
+        else:
+            try:
+                parsed_timestamp = datetime.fromisoformat(
+                    raw_training_timestamp.replace("Z", "+00:00")
+                )
+                if parsed_timestamp.tzinfo is None:
+                    raise ValueError
+            except ValueError:
+                errors.append("training_timestamp must be an ISO-8601 timestamp")
+
+        for key in ("offline_metrics", "calibration_metrics"):
+            metrics = manifest.get(key)
+            if not isinstance(metrics, dict) or not metrics:
+                errors.append(f"missing or invalid {key}")
+                continue
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                for value in metrics.values()
+            ):
+                errors.append(f"{key} values must be finite numbers")
+
+        return list(dict.fromkeys(errors))
 
     @property
     def ready(self) -> bool:

@@ -1,10 +1,12 @@
 import json
+import hashlib
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 import torch
 
+from config import EMBEDDING_MODEL_REVISION, REPOSITORY_EMBEDDING_MODEL
 from inference.feature_spec import (
     EMBEDDING_DIM,
     FEATURE_COUNT,
@@ -12,6 +14,7 @@ from inference.feature_spec import (
     INPUT_DIM,
 )
 from inference.ranker_service import MMoEHeavyRanker, RankerService
+from inference.value_function import VALUE_WEIGHTS
 
 
 def _write_scaler(path, feature_count=FEATURE_COUNT):
@@ -33,6 +36,40 @@ def _write_manifest(path, **overrides):
         "input_dim": INPUT_DIM,
         "embedding_dim": EMBEDDING_DIM,
         "feature_count": FEATURE_COUNT,
+    }
+    manifest.update(overrides)
+    path.write_text(json.dumps(manifest))
+
+
+def _sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_production_manifest(path, *, model_path, scaler_path, **overrides):
+    manifest = {
+        "model_file": model_path.name,
+        "scaler_file": scaler_path.name,
+        "model_sha256": _sha256(model_path),
+        "scaler_sha256": _sha256(scaler_path),
+        "model_version": "heavy-ranker-production-test",
+        "embedding_version": "repo-embedding-test",
+        "embedding_model": REPOSITORY_EMBEDDING_MODEL,
+        "embedding_model_revision": EMBEDDING_MODEL_REVISION,
+        "compatible_embedding_versions": ["repo-embedding-test"],
+        "feature_spec_version": FEATURE_SPEC_VERSION,
+        "input_dim": INPUT_DIM,
+        "embedding_dim": EMBEDDING_DIM,
+        "feature_count": FEATURE_COUNT,
+        "value_function_version": "v1",
+        "value_weights": VALUE_WEIGHTS,
+        "training_data": {
+            "identity": "telemetry-snapshot-2026-07-01",
+            "type": "versioned_production_telemetry",
+        },
+        "training_timestamp": "2026-07-02T12:00:00+00:00",
+        "offline_metrics": {"ndcg_at_15": 0.51},
+        "calibration_metrics": {"expected_calibration_error": 0.04},
+        "code_version": "0123456789abcdef",
     }
     manifest.update(overrides)
     path.write_text(json.dumps(manifest))
@@ -143,6 +180,76 @@ def test_ranker_service_rejects_unlisted_serving_embedding_version(tmp_path):
             scaler_path=str(scaler_path),
             manifest_path=str(manifest_path),
             expected_embedding_version="repo-embedding-v2",
+        )
+
+
+def test_legacy_manifest_loads_for_inspection_but_is_not_production_qualified(
+    tmp_path,
+):
+    scaler_path = tmp_path / "feature_scaler.json"
+    manifest_path = tmp_path / "model_manifest.json"
+    _write_scaler(scaler_path)
+    _write_manifest(manifest_path)
+
+    service = RankerService(
+        model_path=str(tmp_path / "missing_model.pt"),
+        scaler_path=str(scaler_path),
+        manifest_path=str(manifest_path),
+    )
+
+    assert service.production_qualified is False
+    assert "missing or invalid model_sha256" in service.qualification_errors
+    assert "missing or invalid training_data" in service.qualification_errors
+
+
+def test_production_manifest_requires_verified_provenance_and_metrics(tmp_path):
+    scaler_path = tmp_path / "feature_scaler.json"
+    model_path = tmp_path / "heavy_ranker.pt"
+    manifest_path = tmp_path / "model_manifest.json"
+    _write_scaler(scaler_path)
+    model_path.write_bytes(b"model-artifact")
+    _write_production_manifest(
+        manifest_path,
+        model_path=model_path,
+        scaler_path=scaler_path,
+    )
+    state_dict = MMoEHeavyRanker(INPUT_DIM).state_dict()
+
+    with patch("inference.ranker_service.torch.load", return_value=state_dict):
+        service = RankerService(
+            model_path=str(model_path),
+            scaler_path=str(scaler_path),
+            manifest_path=str(manifest_path),
+            expected_embedding_versions={"repo-embedding-test"},
+            expected_embedding_model=REPOSITORY_EMBEDDING_MODEL,
+            expected_embedding_model_revision=EMBEDDING_MODEL_REVISION,
+            require_production_manifest=True,
+        )
+
+    assert service.ready is True
+    assert service.production_qualified is True
+    assert service.qualification_errors == ()
+
+
+def test_synthetic_training_manifest_cannot_be_production_qualified(tmp_path):
+    scaler_path = tmp_path / "feature_scaler.json"
+    model_path = tmp_path / "heavy_ranker.pt"
+    manifest_path = tmp_path / "model_manifest.json"
+    _write_scaler(scaler_path)
+    model_path.write_bytes(b"model-artifact")
+    _write_production_manifest(
+        manifest_path,
+        model_path=model_path,
+        scaler_path=scaler_path,
+        training_data={"identity": "generator-v1", "type": "synthetic"},
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic training data"):
+        RankerService(
+            model_path=str(model_path),
+            scaler_path=str(scaler_path),
+            manifest_path=str(manifest_path),
+            require_production_manifest=True,
         )
 
 

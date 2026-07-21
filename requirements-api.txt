@@ -1,7 +1,15 @@
-# Online ML API: deliberately excludes PostgreSQL drivers.
+# Online ML API/feedback dependency boundary: deliberately excludes PostgreSQL
+# drivers and offline acquisition/scheduler packages. The production Dockerfile
+# currently installs the single project uv.lock for reproducibility; this file
+# documents the narrower target boundary and must be kept aligned before the
+# image is split into a dedicated online lock/export.
 fastapi>=0.110.0
 uvicorn>=0.28.0
 redis>=5.0.0
-qdrant-client>=1.9.0
+qdrant-client>=1.18.0,<2
 numpy>=1.24.0
 pydantic>=2.0.0
+python-dotenv
+requests
+sentence-transformers
+torch

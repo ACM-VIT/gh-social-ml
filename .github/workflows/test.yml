@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ main, develop ]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -24,19 +27,34 @@ jobs:
           --health-retries 5
         ports:
           - 5432:5432
+      redis:
+        image: redis:7.4.5-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+        ports:
+          - 6379:6379
+      qdrant:
+        image: qdrant/qdrant:v1.18.2
+        ports:
+          - 6333:6333
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        fetch-depth: 0
 
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
       with:
         python-version: '3.12'
 
     - name: Install uv
       uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
       with:
-        version: "0.11.16"
+        version: "0.11.29"
         enable-cache: true
 
     - name: Install dependencies
@@ -47,6 +65,27 @@ jobs:
         echo "GITHUB_TOKEN=test_token_12345" >> $GITHUB_ENV
         echo "DATABASE_URL=postgresql://test:test@localhost:5432/test_db" >> $GITHUB_ENV
         echo "TEST_DATABASE_URL=postgresql://test:test@localhost:5432/test_db" >> $GITHUB_ENV
+
+    - name: Wait for Redis and Qdrant
+      run: |
+        python - <<'PY'
+        import socket
+        import time
+
+        deadline = time.monotonic() + 60
+        pending = {("127.0.0.1", 6379), ("127.0.0.1", 6333)}
+        while pending and time.monotonic() < deadline:
+            for address in list(pending):
+                try:
+                    with socket.create_connection(address, timeout=1):
+                        pending.remove(address)
+                except OSError:
+                    pass
+            if pending:
+                time.sleep(0.5)
+        if pending:
+            raise SystemExit(f"Services did not become ready: {sorted(pending)}")
+        PY
 
     - name: Run deterministic tests
       env:
@@ -61,27 +100,47 @@ jobs:
         GITHUB_TOKEN: test_token_12345
         DATABASE_URL: postgresql://test:test@localhost:5432/test_db
         TEST_DATABASE_URL: postgresql://test:test@localhost:5432/test_db
+        REDIS_URL: redis://127.0.0.1:6379/0
+        QDRANT_URL: http://127.0.0.1:6333
+        RUN_FEEDBACK_INTEGRATION: "true"
+        RUN_V2_FEEDBACK_INTEGRATION: "true"
       run: |
         uv run pytest tests/ -m "integration" -v
 
-    - name: Run performance benchmarks
+    - name: Run performance benchmarks with base-branch regression gate
       env:
         GITHUB_TOKEN: test_token_12345
         DATABASE_URL: postgresql://test:test@localhost:5432/test_db
         TEST_DATABASE_URL: postgresql://test:test@localhost:5432/test_db
+        BENCHMARK_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
       run: |
-        uv run pytest tests/ -m "benchmark" --benchmark-only --benchmark-autosave
+        if [ -n "$BENCHMARK_BASE_SHA" ] && [ "$BENCHMARK_BASE_SHA" != "0000000000000000000000000000000000000000" ]; then
+          git worktree add "$RUNNER_TEMP/gh-social-ml-benchmark-base" "$BENCHMARK_BASE_SHA"
+        fi
+        if [ -f "$RUNNER_TEMP/gh-social-ml-benchmark-base/tests/test_v2_performance.py" ]; then
+          cd "$RUNNER_TEMP/gh-social-ml-benchmark-base"
+          "$GITHUB_WORKSPACE/.venv/bin/python" -m pytest tests/test_v2_performance.py \
+            -m benchmark --benchmark-only \
+            --benchmark-storage="file://$GITHUB_WORKSPACE/.benchmarks" \
+            --benchmark-save=base
+          cd "$GITHUB_WORKSPACE"
+          uv run pytest tests/test_v2_performance.py -m benchmark --benchmark-only \
+            --benchmark-compare=base --benchmark-compare-fail=mean:5% \
+            --benchmark-autosave
+        else
+          uv run pytest tests/ -m benchmark --benchmark-only --benchmark-autosave
+        fi
 
     - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v3
+      uses: codecov/codecov-action@e79a6962e0d4c0c17b229090214935d2e33f8354 # v6.0.1
       with:
-        file: ./coverage.xml
+        files: ./coverage.xml
         flags: unittests
         name: codecov-umbrella
         fail_ci_if_error: false
 
     - name: Upload benchmark results
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: benchmark-results
         path: .benchmarks/

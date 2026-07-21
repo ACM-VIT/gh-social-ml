@@ -1,7 +1,6 @@
-import os
+import random
 import pytest
 from datetime import datetime, timezone, timedelta
-from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from app import app
@@ -75,8 +74,7 @@ class TestFeedAssemblySystem:
             for i in range(10)
         ]
 
-        with patch("random.shuffle"):
-            result = FeedAssemblySystem().shape_batch(ranked)
+        result = FeedAssemblySystem().shape_batch(ranked)
 
         assert [item["repo_id"] for item in result[:5]] == [
             f"repo-{i}" for i in range(5)
@@ -125,6 +123,34 @@ class TestFeedAssemblySystem:
 
         assert first == second
 
+    def test_same_generation_keeps_freshness_anchor_across_utc_hour(self):
+        created_at = datetime(2026, 7, 19, 10, 35, tzinfo=timezone.utc)
+        ranked = [{
+            "repo_id": "repo-fresh",
+            "final_score": 0.4,
+            "created_at": created_at,
+        }]
+        assembler = FeedAssemblySystem()
+
+        first = assembler.shape_batch(
+            ranked,
+            generation_id="generation-retried-across-hour",
+            reference_time=datetime(2026, 7, 19, 12, 59, tzinfo=timezone.utc),
+        )
+        retry = assembler.shape_batch(
+            ranked,
+            generation_id="generation-retried-across-hour",
+            reference_time=datetime(2026, 7, 19, 13, 1, tzinfo=timezone.utc),
+        )
+        new_generation = assembler.shape_batch(
+            ranked,
+            generation_id="new-generation-after-hour",
+            reference_time=datetime(2026, 7, 19, 13, 1, tzinfo=timezone.utc),
+        )
+
+        assert retry == first
+        assert new_generation[0]["final_score"] < first[0]["final_score"]
+
     def test_shape_batch_exploration_shuffles_tail(self):
         now = datetime.now(timezone.utc)
         ranked = [
@@ -137,17 +163,52 @@ class TestFeedAssemblySystem:
             for i in range(15)
         ]
 
-        with patch("random.shuffle") as mock_shuffle:
-            result = FeedAssemblySystem().shape_batch(ranked)
+        result = FeedAssemblySystem().shape_batch(
+            ranked,
+            randomizer=random.Random("generation-1"),
+        )
+        repeated = FeedAssemblySystem().shape_batch(
+            ranked,
+            randomizer=random.Random("generation-1"),
+        )
 
-        mock_shuffle.assert_called_once()
-        shuffled_tail = mock_shuffle.call_args.args[0]
-        assert [item["repo_id"] for item in shuffled_tail] == [
-            f"repo-{i}" for i in range(10, 15)
-        ]
+        assert result == repeated
         assert [item["repo_id"] for item in result[:10]] == [
             f"repo-{i}" for i in range(10)
         ]
+        assert {item["repo_id"] for item in result[10:]} == {
+            f"repo-{i}" for i in range(10, 15)
+        }
+
+    def test_shape_batch_150_to_15_explores_inside_returned_tail(self):
+        ranked = [
+            {
+                "repo_id": f"repo-{i}",
+                "final_score": 150.0 - i,
+                "primary_language": f"language-{i % 12}",
+            }
+            for i in range(150)
+        ]
+        assembler = FeedAssemblySystem(max_same_language=15)
+
+        first = assembler.shape_batch(
+            ranked,
+            target_size=15,
+            randomizer=random.Random("fixed-generation"),
+        )
+        second = assembler.shape_batch(
+            ranked,
+            target_size=15,
+            randomizer=random.Random("fixed-generation"),
+        )
+
+        first_ids = [item["repo_id"] for item in first]
+        assert first == second
+        assert len(first_ids) == 15
+        assert len(set(first_ids)) == 15
+        assert first_ids[:10] == [f"repo-{i}" for i in range(10)]
+        assert set(first_ids[10:]).issubset({f"repo-{i}" for i in range(10, 150)})
+        assert any(int(repo_id.removeprefix("repo-")) >= 15 for repo_id in first_ids[10:])
 
     def test_process_feed_assembly_empty(self):
         """Test that passing an empty list of candidates returns an empty list."""
@@ -200,21 +261,12 @@ class TestFeedAssemblySystem:
                 "created_at": now - timedelta(days=10)
             })
 
-        # If exploration count is target // 3 (which is 15 // 3 = 5 repos),
-        # then the top 10 repos (0 to 9) should remain stable in their exploit tier,
-        # while the bottom 5 repos (10 to 14) are shuffled.
-        # Let's mock random.shuffle to verify it's called on the last 5 repos.
-        with patch("random.shuffle") as mock_shuffle:
-            ordered_ids = FeedAssemblySystem.process_feed_assembly(candidates, target_size=15)
-            
-            # Shuffling should be called on the tail of 5 repos
-            mock_shuffle.assert_called_once()
-            called_args = mock_shuffle.call_args[0][0]
-            assert len(called_args) == 5
-            assert {item["repo_id"] for item in called_args} == {f"repo-{i}" for i in range(10, 15)}
-            
-            # The top 10 positions must be preserved exactly
-            assert ordered_ids[:10] == [f"repo-{i}" for i in range(10)]
+        ordered_ids = FeedAssemblySystem.process_feed_assembly(candidates, target_size=15)
+        repeated_ids = FeedAssemblySystem.process_feed_assembly(candidates, target_size=15)
+
+        assert ordered_ids == repeated_ids
+        assert ordered_ids[:10] == [f"repo-{i}" for i in range(10)]
+        assert set(ordered_ids[10:]) == {f"repo-{i}" for i in range(10, 15)}
 
 
 @pytest.mark.unit

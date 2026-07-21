@@ -220,8 +220,11 @@ class FeedbackHandler:
             )
         except ValueError:
             raise
-        except Exception:
-            logger.exception("Feedback event %s failed", logical_id)
+        except Exception as exc:
+            logger.error(
+                "Legacy feedback event failed error_type=%s",
+                type(exc).__name__,
+            )
             return False
 
     def _handle(

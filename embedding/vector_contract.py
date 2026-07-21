@@ -17,12 +17,14 @@ from types import MappingProxyType
 from typing import Any
 
 from config import (
+    EMBEDDING_MODEL_REVISION,
     QDRANT_COLLECTION_NAME,
     QDRANT_DISTANCE,
     QDRANT_VECTOR_NAME,
     REPOSITORY_EMBEDDING_DIM,
     REPOSITORY_EMBEDDING_MODEL,
     REPOSITORY_EMBEDDING_VERSION,
+    REPOSITORY_FEATURE_SPEC_VERSION,
     USER_PROFILES_COLLECTION_NAME,
 )
 
@@ -46,6 +48,14 @@ REPOSITORY_COLLECTION_CONTRACT = VectorCollectionContract(
     model_name=REPOSITORY_EMBEDDING_MODEL,
 )
 
+# This marker is attached by ``QdrantRepositoryStore.upsert`` only after the
+# repository vector and its pre-serving payload have both passed validation.
+# Retrieval can therefore avoid transferring every candidate vector on the
+# default hybrid path while still filtering to points written atomically by the
+# validated ingestion path.
+REPOSITORY_SERVING_ELIGIBILITY_FIELD = "serving_eligibility_version"
+REPOSITORY_SERVING_ELIGIBILITY_VERSION = "repository-vector-v1"
+
 # The existing user_profiles collection stores one unnamed vector per user.
 # Keeping that choice explicit prevents consumers from guessing a vector name.
 USER_PROFILE_COLLECTION_CONTRACT = VectorCollectionContract(
@@ -55,6 +65,12 @@ USER_PROFILE_COLLECTION_CONTRACT = VectorCollectionContract(
     distance=QDRANT_DISTANCE,
     model_name=REPOSITORY_EMBEDDING_MODEL,
 )
+
+# Monotonic scalar fencing every mutation of feedback-owned user payload.
+# Keeping this field in the shared vector contract lets onboarding and the
+# feedback consumer compare the same Qdrant snapshot even when a Redis lease
+# is lost between their read and write.
+FEEDBACK_STATE_REVISION_FIELD = "feedback_state_revision"
 
 # Stable public names for Qdrant-only discovery channels.  Person 3 can select
 # a channel without duplicating knowledge of the underlying payload field.
@@ -203,12 +219,15 @@ REPOSITORY_PAYLOAD_FIELD_TYPES: Mapping[str, type | tuple[type, ...]] = MappingP
         "trend_velocity": (int, float),
         "embedding_dim": int,
         "embedding_model": str,
+        "embedding_model_revision": str,
         "embedding_version": str,
+        "feature_spec_version": str,
         "content_version": int,
         "content_hash": str,
         "model_version": str,
         "indexed_at": str,
         "source_hash": str,
+        "serving_eligibility_version": str,
     }
 )
 
@@ -239,16 +258,49 @@ _TIMESTAMP_FIELDS = {"created_at", "updated_at", "pushed_at", "indexed_at"}
 _STRING_LIST_FIELDS = {"languages", "topics", "tags"}
 
 
-def validate_repository_payload(payload: Mapping[str, Any]) -> None:
-    """Validate one emitted repository payload against the frozen contract."""
+def validate_repository_payload(
+    payload: Mapping[str, Any],
+    *,
+    require_serving_eligibility: bool = True,
+) -> None:
+    """Validate one repository payload against the frozen contract.
+
+    Pre-upsert ingestion payloads must explicitly opt out of the serving
+    marker and are rejected if a caller tries to supply it. The Qdrant store
+    adds the marker only after it has validated the paired vector.
+    """
     if not isinstance(payload, Mapping):
         raise TypeError("repository payload must be a mapping")
 
-    missing = [field for field in REPOSITORY_PAYLOAD_REQUIRED_FIELDS if field not in payload]
+    required_fields = (
+        REPOSITORY_PAYLOAD_REQUIRED_FIELDS
+        if require_serving_eligibility
+        else tuple(
+            field
+            for field in REPOSITORY_PAYLOAD_REQUIRED_FIELDS
+            if field != REPOSITORY_SERVING_ELIGIBILITY_FIELD
+        )
+    )
+    missing = [field for field in required_fields if field not in payload]
     if missing:
         raise ValueError(f"repository payload is missing required fields: {', '.join(missing)}")
 
+    if not require_serving_eligibility:
+        if REPOSITORY_SERVING_ELIGIBILITY_FIELD in payload:
+            raise ValueError(
+                "serving eligibility may only be stamped by validated vector upsert"
+            )
+    elif (
+        payload.get(REPOSITORY_SERVING_ELIGIBILITY_FIELD)
+        != REPOSITORY_SERVING_ELIGIBILITY_VERSION
+    ):
+        raise ValueError(
+            "repository payload serving eligibility version is incompatible"
+        )
+
     for field_name, expected_type in REPOSITORY_PAYLOAD_FIELD_TYPES.items():
+        if field_name not in payload and not require_serving_eligibility:
+            continue
         value = payload[field_name]
         if not isinstance(value, expected_type):
             raise TypeError(
@@ -291,7 +343,9 @@ def validate_repository_payload(payload: Mapping[str, Any]) -> None:
         )
     for field_name in (
         "embedding_model",
+        "embedding_model_revision",
         "embedding_version",
+        "feature_spec_version",
         "content_hash",
         "model_version",
         "source_hash",
@@ -347,7 +401,12 @@ def repository_payload_defaults() -> dict[str, object]:
         "trend_velocity": 0.0,
         "embedding_dim": REPOSITORY_EMBEDDING_DIM,
         "embedding_model": REPOSITORY_EMBEDDING_MODEL,
+        "embedding_model_revision": EMBEDDING_MODEL_REVISION,
         "embedding_version": REPOSITORY_EMBEDDING_VERSION,
+        "feature_spec_version": REPOSITORY_FEATURE_SPEC_VERSION,
         "content_version": 0,
         "model_version": REPOSITORY_EMBEDDING_MODEL,
+        REPOSITORY_SERVING_ELIGIBILITY_FIELD: (
+            REPOSITORY_SERVING_ELIGIBILITY_VERSION
+        ),
     }

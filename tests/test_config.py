@@ -3,6 +3,14 @@
 import os
 import pytest
 
+from config import constant_time_secret_matches
+
+
+def test_constant_time_secret_compare_fails_closed_for_unicode() -> None:
+    assert constant_time_secret_matches("same", "same") is True
+    assert constant_time_secret_matches("é", "same") is False
+    assert constant_time_secret_matches(None, "same") is False
+
 from trending.config import (
     TRENDING_REPO_LIMIT,
     TRENDING_REFRESH_HOURS,

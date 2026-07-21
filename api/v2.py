@@ -1,32 +1,176 @@
 from __future__ import annotations
 
-import hmac
+import asyncio
+import copy
+import logging
 import math
 import os
-import time
-import uuid
-from contextlib import contextmanager
 from dataclasses import asdict
 from functools import lru_cache
-from typing import Any, Literal
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-
-from config import internal_api_header_name
-from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
+from fastapi.responses import PlainTextResponse
+from api.contracts import (
+    FeedbackBatch,
+    OnboardingJob,
+    RecommendationRequest,
+    RepositoryJob,
+    RepositoryFeaturePatch,
+    RepositoryRefreshJob,
+)
+from api.runtime import (
+    ServiceCapacityError,
+    ServiceDeadlineExceeded,
+    run_service_job,
+    service_runtime_status,
+    shutdown_service_runtime,
+    validate_service_runtime,
+)
+from api.metrics import record_recommendation, render_prometheus
+from config import constant_time_secret_matches, internal_api_header_name
 from embedding.qdrant_store import QdrantRepositoryStore
-from embedding.vector_contract import repository_point_ids
-from feedback.v2 import DurableFeedbackProducer
-from retrieval.v2_retriever import QdrantV2Retriever
-from scripts.user_onboarding import UserOnboardingPipeline
+from embedding.runtime import (
+    EmbeddingCapacityError,
+    embedding_runtime_status,
+    embedding_warmup_enabled,
+    repository_embedding_pipeline,
+    run_embedding_job,
+    shutdown_embedding_runtime,
+    user_onboarding_pipeline,
+)
+from embedding.user_profile_store import QdrantUserProfileStore
+from embedding.vector_contract import (
+    repository_point_ids,
+    validate_repository_payload,
+)
+from scripts.user_onboarding import UserProfileWriteConflict
+from feedback.v2 import (
+    DurableFeedbackProducer,
+    FeedbackEnqueueError,
+    FeedbackEventIdConflictError,
+)
+from feedback.v2_settings import V2FeedbackSettings
+from feedback.user_lock import (
+    LockAcquisitionError,
+    LockLostError,
+    renewable_redis_lock,
+    user_vector_lock,
+)
+from inference.runtime import (
+    RecommendationCapacityError,
+    RecommendationDeadlineExceeded,
+    run_recommendation_job,
+    recommendation_runtime_status,
+    shutdown_recommendation_runtime,
+    validate_recommendation_runtime,
+)
+from retrieval.v2_retriever import QdrantV2Retriever, RetrievalDependencyError
 
 router = APIRouter(prefix="/api/v2", tags=["v2"])
-EventType = Literal[
-    "impression", "dwell", "readme_open", "github_open", "like", "unlike",
-    "dislike", "undislike", "save", "unsave", "share",
-]
+logger = logging.getLogger("pipeline.api.v2")
+
+
+class V2ServiceHTTPException(HTTPException):
+    """HTTP error with an explicit stable machine contract."""
+
+    def __init__(
+        self,
+        *,
+        status_code: int,
+        detail: str,
+        error_code: str,
+        retryable: bool,
+        headers: dict[str, str] | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(status_code=status_code, detail=detail, headers=headers)
+        self.error_code = error_code
+        self.retryable = retryable
+        self.safe_details = details
+
+
+def _is_temporary_dependency_error(exc: Exception) -> bool:
+    """Classify only known transport/capacity failures as retryable.
+
+    Unknown ValueError/RuntimeError/programming failures must remain a sanitized
+    non-retryable 500; treating all exceptions as temporary creates backend
+    retry storms and can conceal stored-data corruption.
+    """
+    if isinstance(
+        exc,
+        (
+            ConnectionError,
+            TimeoutError,
+            RetrievalDependencyError,
+            LockAcquisitionError,
+            LockLostError,
+            EmbeddingCapacityError,
+        ),
+    ):
+        return True
+
+    exception_type = type(exc)
+    module = exception_type.__module__
+    name = exception_type.__name__
+    if module.startswith("redis.exceptions") and name in {
+        "BusyLoadingError",
+        "ClusterDownError",
+        "ConnectionError",
+        "MasterDownError",
+        "MaxConnectionsError",
+        "ReadOnlyError",
+        "TimeoutError",
+        "TryAgainError",
+    }:
+        return True
+    if module.startswith(("httpx", "httpcore", "grpc")) and any(
+        token in name
+        for token in ("Connect", "Connection", "Network", "Pool", "Timeout")
+    ):
+        return True
+    if module.startswith("qdrant_client"):
+        status_code = getattr(exc, "status_code", None)
+        if isinstance(status_code, int):
+            return status_code in {408, 425, 429} or status_code >= 500
+        source = getattr(exc, "source", None)
+        if isinstance(source, Exception) and source is not exc:
+            return _is_temporary_dependency_error(source)
+    return False
+
+
+def _operation_error(
+    operation: str,
+    exc: Exception,
+    *,
+    request_id: str,
+) -> HTTPException:
+    temporary = _is_temporary_dependency_error(exc)
+    logger.error(
+        "V2 operation failed request_id=%s operation=%s error_type=%s retryable=%s",
+        request_id,
+        operation,
+        type(exc).__name__,
+        temporary,
+        extra={
+            "dependency_context": {
+                "operation": operation,
+                "request_id": request_id,
+                "error_type": type(exc).__name__,
+                "retryable": temporary,
+            }
+        },
+    )
+    if not temporary:
+        return HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="The ML service could not complete the operation.",
+        )
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="A required ML dependency is temporarily unavailable.",
+        headers={"Retry-After": "2"},
+    )
 
 
 async def require_internal_secret(
@@ -36,91 +180,8 @@ async def require_internal_secret(
     if not expected:
         raise HTTPException(status_code=503, detail="Internal API secret is not configured.")
     supplied = request.headers.get(internal_api_header_name())
-    if not supplied or not hmac.compare_digest(supplied, expected):
+    if not constant_time_secret_matches(supplied, expected):
         raise HTTPException(status_code=401, detail="Invalid or missing internal secret.")
-
-
-class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-
-class RecommendationContext(StrictModel):
-    cold_start: bool = False
-    locale: str | None = Field(default=None, max_length=32)
-
-
-class RecommendationRequest(StrictModel):
-    schema_version: Literal[2]
-    generation_id: uuid.UUID
-    user_id: uuid.UUID
-    feed_version: int = Field(ge=1)
-    limit: int = Field(ge=1, le=100)
-    exclude_repo_ids: list[uuid.UUID] = Field(default_factory=list, max_length=500)
-    context: RecommendationContext
-
-    @field_validator("exclude_repo_ids")
-    @classmethod
-    def unique_exclusions(cls, value: list[uuid.UUID]) -> list[uuid.UUID]:
-        if len(set(value)) != len(value):
-            raise ValueError("exclude_repo_ids must be unique")
-        return value
-
-
-class FeedbackEvent(StrictModel):
-    event_id: uuid.UUID
-    user_id: uuid.UUID
-    repo_id: uuid.UUID
-    feedback_version: int = Field(ge=1)
-    event_type: EventType
-    dwell_ms: int | None = None
-    occurred_at: str
-
-    @model_validator(mode="after")
-    def validate_dwell(self):
-        if self.event_type == "impression":
-            raise ValueError("impressions are offline-only and must not be sent to ML")
-        if self.event_type == "dwell":
-            if self.dwell_ms is None or not 3_000 <= self.dwell_ms <= 300_000:
-                raise ValueError("dwell_ms must be between 3000 and 300000")
-        elif self.dwell_ms is not None:
-            raise ValueError("only dwell events may carry dwell_ms")
-        return self
-
-
-class FeedbackBatch(StrictModel):
-    schema_version: Literal[2]
-    events: list[FeedbackEvent] = Field(min_length=1, max_length=100)
-
-    @field_validator("events")
-    @classmethod
-    def unique_events(cls, value: list[FeedbackEvent]) -> list[FeedbackEvent]:
-        if len({event.event_id for event in value}) != len(value):
-            raise ValueError("event_id values must be unique within a batch")
-        return value
-
-
-class RepositoryJob(StrictModel):
-    schema_version: Literal[2]
-    job_id: uuid.UUID
-    repo_id: uuid.UUID
-    content_version: int = Field(ge=1)
-    repository: dict[str, Any]
-
-
-class RepositoryRefreshJob(StrictModel):
-    schema_version: Literal[2]
-    job_id: uuid.UUID
-    repo_id: uuid.UUID
-    feature_version: int = Field(ge=1)
-    features: dict[str, Any]
-
-
-class OnboardingJob(StrictModel):
-    schema_version: Literal[2]
-    job_id: uuid.UUID
-    user_id: uuid.UUID
-    profile_version: int = Field(ge=1)
-    profile: dict[str, Any]
 
 
 @lru_cache(maxsize=1)
@@ -129,8 +190,71 @@ def retriever() -> QdrantV2Retriever:
 
 
 @lru_cache(maxsize=1)
+def feedback_settings() -> V2FeedbackSettings:
+    return V2FeedbackSettings.from_env()
+
+
+@lru_cache(maxsize=1)
 def producer() -> DurableFeedbackProducer:
-    return DurableFeedbackProducer()
+    return DurableFeedbackProducer(settings=feedback_settings())
+
+
+def _enqueue_feedback(events: list[dict[str, Any]]) -> tuple[int, int]:
+    """Resolve the lazy Redis client inside a worker, never on the event loop."""
+    return producer().enqueue(events)
+
+
+def _qdrant_health() -> dict[str, Any]:
+    return retriever().health()
+
+
+def _feedback_health() -> dict[str, Any]:
+    return producer().health()
+
+
+@lru_cache(maxsize=1)
+def repository_store() -> QdrantRepositoryStore:
+    pipeline = repository_embedding_pipeline()
+    store = QdrantRepositoryStore(
+        vector_size=pipeline.config.embedding_dim,
+        client=retriever().client,
+    )
+    store.ensure_collection()
+    return store
+
+
+@lru_cache(maxsize=1)
+def user_profile_store() -> QdrantUserProfileStore:
+    store = QdrantUserProfileStore(client=retriever().client)
+    store.ensure_collection()
+    return store
+
+
+def onboarding_pipeline():
+    pipeline = user_onboarding_pipeline()
+    pipeline.store = user_profile_store()
+    return pipeline
+
+
+def shutdown_v2_runtime() -> None:
+    """Close process-scoped clients and executors without creating new ones."""
+    if producer.cache_info().currsize:
+        redis = producer().redis
+        close = getattr(redis, "close", None)
+        if close:
+            close()
+    if retriever.cache_info().currsize:
+        close = getattr(retriever().client, "close", None)
+        if close:
+            close()
+    repository_store.cache_clear()
+    user_profile_store.cache_clear()
+    producer.cache_clear()
+    retriever.cache_clear()
+    feedback_settings.cache_clear()
+    shutdown_recommendation_runtime()
+    shutdown_service_runtime()
+    shutdown_embedding_runtime()
 
 
 def _repository_points(repo_id: str) -> list[Any]:
@@ -152,14 +276,25 @@ def _repository_job_status(
     job_id: str,
 ) -> tuple[str, int]:
     payloads = [dict(point.payload or {}) for point in points]
-    if any(str(payload.get(job_field) or "") == job_id for payload in payloads):
-        current = max(
-            (int(payload.get(version_field) or 0) for payload in payloads), default=0
-        )
-        return "duplicate", current
     current = max(
         (int(payload.get(version_field) or 0) for payload in payloads), default=0
     )
+    matching_jobs = [
+        payload
+        for payload in payloads
+        if str(payload.get(job_field) or "") == job_id
+    ]
+    if matching_jobs:
+        matched_version = max(
+            (int(payload.get(version_field) or 0) for payload in matching_jobs),
+            default=0,
+        )
+        if matched_version != requested_version:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"job_id was already used for {version_field} {matched_version}",
+            )
+        return "duplicate", current
     if requested_version < current:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -172,146 +307,415 @@ def _repository_job_status(
     return "apply", current
 
 
-@contextmanager
+def _single_repository_point(points: list[Any]) -> Any | None:
+    """Reject split canonical/legacy state instead of updating it non-atomically."""
+
+    distinct = {str(point.id): point for point in points}
+    if len(distinct) > 1:
+        raise V2ServiceHTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Repository identity requires coordinated offline reconciliation.",
+            error_code="REPOSITORY_IDENTITY_CONFLICT",
+            retryable=False,
+        )
+    return next(iter(distinct.values()), None)
+
+
+def _repository_cas_outcome(
+    point: Any | None,
+    *,
+    version_field: str,
+    job_field: str,
+    requested_version: int,
+    job_id: str,
+) -> tuple[str, int]:
+    """Verify a conditional write and classify the winner without guessing."""
+
+    if point is None:
+        raise V2ServiceHTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Repository state changed during the write; retry the request.",
+            error_code="CONCURRENT_REPOSITORY_WRITE",
+            retryable=True,
+            headers={"Retry-After": "2"},
+        )
+    payload = dict(point.payload or {})
+    try:
+        current = int(payload.get(version_field) or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"stored {version_field} is invalid") from exc
+    if str(payload.get(job_field) or "") == job_id and current == requested_version:
+        return "applied", current
+
+    job_status, current = _repository_job_status(
+        [point],
+        version_field=version_field,
+        job_field=job_field,
+        requested_version=requested_version,
+        job_id=job_id,
+    )
+    if job_status == "apply":
+        # The version stayed old, so another independent field changed and
+        # correctly fenced this write. A retry can merge that newer snapshot.
+        raise V2ServiceHTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Repository state changed during the write; retry the request.",
+            error_code="CONCURRENT_REPOSITORY_WRITE",
+            retryable=True,
+            headers={"Retry-After": "2"},
+        )
+    return job_status, current
+
+
+def _repository_job_lock_settings() -> tuple[int, float]:
+    try:
+        ttl_ms = int(os.getenv("REPOSITORY_JOB_LOCK_TTL_MS", "600000").strip())
+        wait_seconds = float(
+            os.getenv("REPOSITORY_JOB_LOCK_WAIT_SECONDS", "30").strip()
+        )
+    except ValueError as exc:
+        raise RuntimeError("repository lock settings are invalid") from exc
+    if ttl_ms < 1_000 or not 0 <= wait_seconds <= 300:
+        raise RuntimeError(
+            "REPOSITORY_JOB_LOCK_TTL_MS must be >= 1000 and lock wait must be 0-300 seconds"
+        )
+    return ttl_ms, wait_seconds
+
+
+def _health_timeout_seconds() -> float:
+    try:
+        timeout = float(os.getenv("V2_HEALTH_TIMEOUT_SECONDS", "5").strip())
+    except ValueError as exc:
+        raise RuntimeError("V2_HEALTH_TIMEOUT_SECONDS is invalid") from exc
+    if not math.isfinite(timeout) or not 0.1 <= timeout <= 30:
+        raise RuntimeError("V2_HEALTH_TIMEOUT_SECONDS must be between 0.1 and 30")
+    return timeout
+
+
+def validate_v2_runtime_configuration() -> V2FeedbackSettings:
+    """Validate network-free v2 runtime settings during process startup."""
+    settings = feedback_settings()
+    _repository_job_lock_settings()
+    _health_timeout_seconds()
+    embedding_warmup_enabled()
+    validate_recommendation_runtime()
+    validate_service_runtime()
+    # Client construction validates retrieval/ranker configuration and, when
+    # enabled, verifies heavy-ranker artifacts without querying Qdrant.
+    retriever()
+    return settings
+
+
 def _repository_job_lock(repo_id: str):
     redis = producer().redis
     key = f"ml:repository-job-lock:{repo_id}"
-    token = str(uuid.uuid4())
-    ttl_ms = int(os.getenv("REPOSITORY_JOB_LOCK_TTL_MS", "600000"))
-    wait_seconds = float(os.getenv("REPOSITORY_JOB_LOCK_WAIT_SECONDS", "30"))
-    deadline = time.monotonic() + wait_seconds
-    while not redis.set(key, token, nx=True, px=ttl_ms):
-        if time.monotonic() >= deadline:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=f"Timed out waiting for repository job lock for {repo_id}.",
-            )
-        time.sleep(0.05)
+    ttl_ms, wait_seconds = _repository_job_lock_settings()
     try:
-        yield
-    finally:
-        redis.eval(
-            "if redis.call('get', KEYS[1]) == ARGV[1] then "
-            "return redis.call('del', KEYS[1]) else return 0 end",
-            1,
+        return renewable_redis_lock(
+            redis,
             key,
-            token,
+            ttl_ms=ttl_ms,
+            wait_seconds=wait_seconds,
         )
+    except (LockAcquisitionError, LockLostError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Repository job is temporarily locked; retry the request.",
+            headers={"Retry-After": "2"},
+        ) from exc
 
 
 def _embed_repository_job(request: RepositoryJob) -> dict[str, Any]:
     repo_id = str(request.repo_id)
     job_id = str(request.job_id)
-    with _repository_job_lock(repo_id):
-        points = _repository_points(repo_id)
-        job_status, current = _repository_job_status(
-            points,
-            version_field="content_version",
-            job_field="content_job_id",
-            requested_version=request.content_version,
-            job_id=job_id,
-        )
-        if job_status != "apply":
-            return {
-                "accepted": True,
-                "status": job_status,
-                "repo_id": repo_id,
-                "content_version": current,
-            }
+    try:
+        lock_context = _repository_job_lock(repo_id)
+        with lock_context as lock:
+            return _embed_repository_job_locked(request, lock)
+    except (LockAcquisitionError, LockLostError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Repository job lock was unavailable; retry the request.",
+            headers={"Retry-After": "2"},
+        ) from exc
 
-        payload = dict(request.repository)
-        payload.update({
-            "id": repo_id,
-            "repo_id": repo_id,
-            "content_version": request.content_version,
-        })
-        pipeline = RepositoryEmbeddingPipeline()
-        result = pipeline.embed_repository(payload)
-        result.payload["content_job_id"] = job_id
 
-        store = QdrantRepositoryStore(
-            vector_size=pipeline.config.embedding_dim,
-            client=retriever().client,
-        )
-        store.ensure_collection()
-        store.upsert([result])
-        _, legacy_repo_id = repository_point_ids(repo_id)
-        if any(str(point.id) == legacy_repo_id for point in points):
-            # The canonical upsert succeeded, so removing the old identity can
-            # no longer make the repository unavailable during cutover.
-            retriever().client.delete(
-                collection_name=retriever().repository_collection,
-                points_selector=[legacy_repo_id],
-                wait=True,
-            )
+def _embed_repository_job_locked(request: RepositoryJob, lock: Any) -> dict[str, Any]:
+    repo_id = str(request.repo_id)
+    job_id = str(request.job_id)
+    lock.assert_owned()
+    points = _repository_points(repo_id)
+    expected_point = _single_repository_point(points)
+    job_status, current = _repository_job_status(
+        points,
+        version_field="content_version",
+        job_field="content_job_id",
+        requested_version=request.content_version,
+        job_id=job_id,
+    )
+    if job_status != "apply":
         return {
             "accepted": True,
-            "status": "applied",
+            "status": job_status,
             "repo_id": repo_id,
-            "content_version": request.content_version,
-            "embedding_version": result.embedding_version,
+            "content_version": current,
         }
+
+    payload = request.repository.model_dump(mode="json")
+    readme = payload.pop("readme", None)
+    if readme is not None:
+        payload["extracted_paragraphs"] = [readme]
+        payload["readme_length"] = len(readme)
+    payload.update({
+        "id": repo_id,
+        "repo_id": repo_id,
+        "content_version": request.content_version,
+    })
+    pipeline = repository_embedding_pipeline()
+    result = pipeline.embed_repository(payload)
+    result.payload["content_job_id"] = job_id
+
+    # Content upsert replaces the complete point. Carry forward independently
+    # refreshed feature state from the exact snapshot used by the CAS so it is
+    # never reset by a newer content embedding.
+    if expected_point is not None:
+        expected_payload = dict(expected_point.payload or {})
+        preserved_fields = ["feature_version", "feature_job_id"]
+        if "feature_version" in expected_payload:
+            preserved_fields.extend(RepositoryFeaturePatch.model_fields)
+        for field in preserved_fields:
+            if field in expected_payload:
+                result.payload[field] = copy.deepcopy(expected_payload[field])
+
+    lock.assert_owned()
+    stored = repository_store().compare_and_set_content(
+        result,
+        expected_point=expected_point,
+    )
+    lock.assert_owned()
+    final_status, final_version = _repository_cas_outcome(
+        stored,
+        version_field="content_version",
+        job_field="content_job_id",
+        requested_version=request.content_version,
+        job_id=job_id,
+    )
+    return {
+        "accepted": True,
+        "status": final_status,
+        "repo_id": repo_id,
+        "content_version": final_version,
+        "embedding_version": result.embedding_version,
+    }
 
 
 def _refresh_repository_job(request: RepositoryRefreshJob) -> dict[str, Any]:
     repo_id = str(request.repo_id)
-    job_id = str(request.job_id)
-    with _repository_job_lock(repo_id):
-        points = _repository_points(repo_id)
-        if not points:
-            raise HTTPException(
-                status_code=404, detail=f"Repository {repo_id} is not indexed."
-            )
-        job_status, current = _repository_job_status(
-            points,
-            version_field="feature_version",
-            job_field="feature_job_id",
-            requested_version=request.feature_version,
-            job_id=job_id,
-        )
-        if job_status != "apply":
-            return {
-                "accepted": True,
-                "status": job_status,
-                "repo_id": repo_id,
-                "feature_version": current,
-            }
+    try:
+        with _repository_job_lock(repo_id) as lock:
+            return _refresh_repository_job_locked(request, lock)
+    except (LockAcquisitionError, LockLostError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Repository job lock was unavailable; retry the request.",
+            headers={"Retry-After": "2"},
+        ) from exc
 
-        retriever().client.set_payload(
-            collection_name=retriever().repository_collection,
-            payload={
-                **request.features,
-                "feature_version": request.feature_version,
-                "feature_job_id": job_id,
-            },
-            points=[point.id for point in points],
-            wait=True,
+
+def _refresh_repository_job_locked(
+    request: RepositoryRefreshJob, lock: Any
+) -> dict[str, Any]:
+    repo_id = str(request.repo_id)
+    job_id = str(request.job_id)
+    lock.assert_owned()
+    points = _repository_points(repo_id)
+    if not points:
+        raise HTTPException(
+            status_code=404, detail=f"Repository {repo_id} is not indexed."
         )
+    expected_point = _single_repository_point(points)
+    job_status, current = _repository_job_status(
+        points,
+        version_field="feature_version",
+        job_field="feature_job_id",
+        requested_version=request.feature_version,
+        job_id=job_id,
+    )
+    if job_status != "apply":
         return {
             "accepted": True,
-            "status": "applied",
+            "status": job_status,
             "repo_id": repo_id,
-            "feature_version": request.feature_version,
+            "feature_version": current,
         }
+
+    features = request.features.model_dump(mode="json", exclude_none=True)
+    updated = {
+        **dict(expected_point.payload or {}),
+        **features,
+        "feature_version": request.feature_version,
+        "feature_job_id": job_id,
+    }
+    validate_repository_payload(updated)
+
+    lock.assert_owned()
+    stored = repository_store().compare_and_set_features(
+        expected_point=expected_point,
+        feature_payload={
+            **features,
+            "feature_version": request.feature_version,
+            "feature_job_id": job_id,
+        },
+    )
+    lock.assert_owned()
+    final_status, final_version = _repository_cas_outcome(
+        stored,
+        version_field="feature_version",
+        job_field="feature_job_id",
+        requested_version=request.feature_version,
+        job_id=job_id,
+    )
+    return {
+        "accepted": True,
+        "status": final_status,
+        "repo_id": repo_id,
+        "feature_version": final_version,
+    }
+
+
+def _user_job_status(
+    point: Any | None,
+    *,
+    requested_version: int,
+    job_id: str,
+) -> tuple[str, int]:
+    payload = dict(point.payload or {}) if point is not None else {}
+    try:
+        current = int(payload.get("profile_version") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("stored profile_version is invalid") from exc
+    stored_job = str(payload.get("job_id") or "")
+    if stored_job == job_id:
+        if current != requested_version:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"job_id was already used for profile_version {current}",
+            )
+        return "duplicate", current
+    if requested_version < current:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"profile_version {requested_version} is older than stored version {current}."
+            ),
+        )
+    if requested_version == current and current > 0:
+        return "current", current
+    return "apply", current
+
+
+def _onboard_user_job(request: OnboardingJob) -> dict[str, Any]:
+    user_id = str(request.user_id)
+    job_id = str(request.job_id)
+    redis = producer().redis
+    try:
+        with user_vector_lock(
+            redis,
+            user_id,
+            settings=feedback_settings(),
+        ) as lock:
+            store = user_profile_store()
+            existing = store.retrieve_user(user_id)
+            job_status, current = _user_job_status(
+                existing,
+                requested_version=request.profile_version,
+                job_id=job_id,
+            )
+            if job_status != "apply":
+                return {
+                    "accepted": True,
+                    "status": job_status,
+                    "user_id": user_id,
+                    "profile_version": current,
+                }
+
+            profile = request.profile.model_dump(mode="json", exclude_none=True)
+            pipeline = onboarding_pipeline()
+            vector = pipeline.generate_interest_vector(profile)
+            payload = {
+                **profile,
+                "job_id": job_id,
+                "profile_version": request.profile_version,
+            }
+            lock.assert_owned()
+            pipeline.save_to_qdrant(
+                user_id,
+                vector,
+                payload,
+                expected_point=existing,
+            )
+            lock.assert_owned()
+            return {
+                "accepted": True,
+                "status": "applied",
+                "user_id": user_id,
+                "profile_version": request.profile_version,
+            }
+    except (LockAcquisitionError, LockLostError, UserProfileWriteConflict) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="User profile is temporarily locked; retry the request.",
+            headers={"Retry-After": "2"},
+        ) from exc
 
 
 @router.post(
     "/recommendations/generate", dependencies=[Depends(require_internal_secret)]
 )
-async def generate_recommendations(request: RecommendationRequest):
-    batch = await run_in_threadpool(
-        retriever().recommend_batch,
-        str(request.user_id),
-        request.limit,
-        [str(item) for item in request.exclude_repo_ids],
-        str(request.generation_id),
-    )
+async def generate_recommendations(
+    request: RecommendationRequest,
+    http_request: Request,
+):
+    try:
+        batch = await run_recommendation_job(
+            retriever().recommend_batch,
+            str(request.user_id),
+            request.limit,
+            [str(item) for item in request.exclude_repo_ids],
+            str(request.generation_id),
+            request.context.cold_start,
+        )
+    except HTTPException:
+        raise
+    except RecommendationCapacityError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Recommendation capacity is temporarily exhausted; retry the request.",
+            headers={"Retry-After": "1"},
+        ) from exc
+    except RecommendationDeadlineExceeded as exc:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Recommendation generation exceeded its bounded deadline.",
+            headers={"Retry-After": "1"},
+        ) from exc
+    except Exception as exc:
+        raise _operation_error(
+            "recommendations",
+            exc,
+            request_id=str(http_request.state.request_id),
+        ) from exc
     items = batch.items
     invalid_scores = any(not math.isfinite(item.score) for item in items)
     if len({item.repo_id for item in items}) != len(items) or invalid_scores:
         raise HTTPException(
             status_code=500, detail="Retriever produced invalid recommendations."
         )
+    record_recommendation(
+        served_ranker=str(getattr(batch, "served_ranker", "hybrid")),
+        fallback_code=getattr(batch, "fallback_code", None),
+        item_count=len(items),
+    )
     return {
         "schema_version": 2,
         "generation_id": str(request.generation_id),
@@ -319,6 +723,17 @@ async def generate_recommendations(request: RecommendationRequest):
         "feed_version": request.feed_version,
         "model_version": batch.model_version,
         "embedding_version": batch.embedding_version,
+        "embedding_versions": list(getattr(batch, "embedding_versions", ())),
+        "served_ranker": getattr(batch, "served_ranker", "hybrid"),
+        "heavy_ranker_selected": getattr(batch, "heavy_ranker_selected", False),
+        "ranker_applied": batch.ranker_applied,
+        "fallback_code": getattr(batch, "fallback_code", None),
+        "fallback_reason": getattr(batch, "fallback_reason", None),
+        "retrieval_mode": getattr(batch, "retrieval_mode", "personalized"),
+        "context_status": {
+            "cold_start_applied": request.context.cold_start,
+            "locale": "reserved_unused" if request.context.locale else "not_provided",
+        },
         "items": [asdict(item) for item in items],
     }
 
@@ -328,52 +743,180 @@ async def generate_recommendations(request: RecommendationRequest):
     status_code=status.HTTP_202_ACCEPTED,
     dependencies=[Depends(require_internal_secret)],
 )
-async def submit_feedback(request: FeedbackBatch):
+async def submit_feedback(request: FeedbackBatch, http_request: Request):
     events = [event.model_dump(mode="json") for event in request.events]
-    accepted, duplicates = await run_in_threadpool(producer().enqueue, events)
+    try:
+        accepted, duplicates = await run_service_job(
+            "feedback", _enqueue_feedback, events
+        )
+    except FeedbackEventIdConflictError as exc:
+        raise V2ServiceHTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="event_id was already used with a different feedback payload.",
+            error_code="EVENT_ID_PAYLOAD_CONFLICT",
+            retryable=False,
+            details={
+                "failed_event_id": exc.failed_event_id,
+                "accepted": exc.accepted,
+                "duplicates": exc.duplicates,
+                "retry_guidance": "remove the conflicting event; retrying other events is dedupe-safe",
+            },
+        ) from exc
+    except FeedbackEnqueueError as exc:
+        logger.error(
+            "V2 feedback batch was only partially enqueued request_id=%s",
+            str(http_request.state.request_id),
+            extra={
+                "feedback_batch_context": {
+                    "request_id": str(http_request.state.request_id),
+                    "accepted": exc.accepted,
+                    "duplicates": exc.duplicates,
+                    "status": "retry_required",
+                }
+            },
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Feedback storage is temporarily unavailable; retry the complete batch.",
+            headers={"Retry-After": "1"},
+        ) from exc
+    except (ServiceCapacityError, ServiceDeadlineExceeded) as exc:
+        raise V2ServiceHTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Feedback admission is temporarily unavailable; retry the complete batch.",
+            error_code="FEEDBACK_CAPACITY_UNAVAILABLE",
+            retryable=True,
+            headers={"Retry-After": "1"},
+        ) from exc
     return {"accepted": accepted, "duplicates": duplicates, "durable": True}
 
 
 @router.post("/repositories/embed", dependencies=[Depends(require_internal_secret)])
-async def embed_repository(request: RepositoryJob):
-    return await run_in_threadpool(_embed_repository_job, request)
+async def embed_repository(request: RepositoryJob, http_request: Request):
+    try:
+        return await run_embedding_job(_embed_repository_job, request)
+    except HTTPException:
+        raise
+    except EmbeddingCapacityError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Embedding capacity is temporarily exhausted; retry the request.",
+            headers={"Retry-After": "2"},
+        ) from exc
+    except Exception as exc:
+        raise _operation_error(
+            "repository_embedding",
+            exc,
+            request_id=str(http_request.state.request_id),
+        ) from exc
 
 
 @router.post("/repositories/refresh", dependencies=[Depends(require_internal_secret)])
-async def refresh_repository(request: RepositoryRefreshJob):
-    return await run_in_threadpool(_refresh_repository_job, request)
+async def refresh_repository(request: RepositoryRefreshJob, http_request: Request):
+    try:
+        return await run_service_job("refresh", _refresh_repository_job, request)
+    except HTTPException:
+        raise
+    except (ServiceCapacityError, ServiceDeadlineExceeded) as exc:
+        raise V2ServiceHTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Repository refresh capacity is temporarily unavailable; retry the request.",
+            error_code="REFRESH_CAPACITY_UNAVAILABLE",
+            retryable=True,
+            headers={"Retry-After": "2"},
+        ) from exc
+    except Exception as exc:
+        raise _operation_error(
+            "repository_refresh",
+            exc,
+            request_id=str(http_request.state.request_id),
+        ) from exc
 
 
 @router.post("/users/onboard", dependencies=[Depends(require_internal_secret)])
-async def onboard_user(request: OnboardingJob):
-    pipeline = UserOnboardingPipeline()
-    vector = await run_in_threadpool(pipeline.generate_interest_vector, request.profile)
-    payload = {
-        **request.profile,
-        "job_id": str(request.job_id),
-        "profile_version": request.profile_version,
-    }
-    await run_in_threadpool(
-        pipeline.save_to_qdrant, str(request.user_id), vector, payload
-    )
-    return {
-        "accepted": True,
-        "user_id": str(request.user_id),
-        "profile_version": request.profile_version,
-    }
+async def onboard_user(request: OnboardingJob, http_request: Request):
+    try:
+        return await run_embedding_job(_onboard_user_job, request)
+    except HTTPException:
+        raise
+    except EmbeddingCapacityError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Embedding capacity is temporarily exhausted; retry the request.",
+            headers={"Retry-After": "2"},
+        ) from exc
+    except Exception as exc:
+        raise _operation_error(
+            "user_onboarding",
+            exc,
+            request_id=str(http_request.state.request_id),
+        ) from exc
 
 
 @router.get("/health", dependencies=[Depends(require_internal_secret)])
-async def health():
+async def health(request: Request):
     try:
-        qdrant = await run_in_threadpool(retriever().health)
-        redis = await run_in_threadpool(producer().health)
+        qdrant, redis = await asyncio.gather(
+            run_service_job("health", _qdrant_health),
+            run_service_job("health", _feedback_health),
+        )
+        embedding = embedding_runtime_status()
         consumer_required = os.getenv(
             "V2_FEEDBACK_CONSUMER_REQUIRED",
             "true" if os.getenv("APP_ENV", "development").lower() == "production" else "false",
         ).strip().lower() in {"1", "true", "yes", "on"}
         if consumer_required and not redis.get("feedback_consumer_active"):
             raise RuntimeError("V2 feedback consumer heartbeat is missing")
-        return {"status": "healthy", **qdrant, **redis, "database_required": False}
+        if not redis.get("feedback_healthy", True):
+            raise RuntimeError("V2 feedback thresholds exceeded")
+        if (
+            os.getenv("APP_ENV", "development").strip().casefold() == "production"
+            and not embedding["embedding_runtime_ready"]
+        ):
+            raise RuntimeError("embedding runtime is not ready")
+        return {
+            "status": "healthy",
+            **qdrant,
+            **redis,
+            **embedding,
+            "service_executors": {
+                **service_runtime_status(),
+                "recommendation": recommendation_runtime_status(),
+            },
+            "database_required": False,
+        }
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Dependency health check failed: {exc}") from exc
+        logger.error(
+            "V2 dependency health check failed request_id=%s error_type=%s",
+            str(request.state.request_id),
+            type(exc).__name__,
+            extra={
+                "health_context": {
+                    "request_id": str(request.state.request_id),
+                    "error_type": type(exc).__name__,
+                }
+            },
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Dependency health check failed.",
+        ) from exc
+
+
+@router.get(
+    "/metrics",
+    response_class=PlainTextResponse,
+    dependencies=[Depends(require_internal_secret)],
+)
+async def metrics() -> PlainTextResponse:
+    """Expose fixed-cardinality Prometheus metrics behind internal auth."""
+
+    return PlainTextResponse(
+        render_prometheus(
+            {
+                **service_runtime_status(),
+                "recommendation": recommendation_runtime_status(),
+            }
+        ),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )

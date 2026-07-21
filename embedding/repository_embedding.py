@@ -26,12 +26,14 @@ def _parse_list_field(val: Any) -> list[str]:
     return []
 
 from config import (
+    EMBEDDING_MODEL_REVISION,
     README_CHUNK_CHARS,
     README_CHUNK_OVERLAP_CHARS,
     REPO_TOWER_WEIGHTS,
     REPOSITORY_EMBEDDING_DIM,
     REPOSITORY_EMBEDDING_MODEL,
     REPOSITORY_EMBEDDING_VERSION,
+    REPOSITORY_FEATURE_SPEC_VERSION,
 )
 from .embeddings import Vector, aggregate_vectors
 from .vector_contract import (
@@ -328,7 +330,9 @@ def build_vector_payload(
         ),
         "embedding_dim": len(validated_embedding),
         "embedding_model": config.model_name,
+        "embedding_model_revision": EMBEDDING_MODEL_REVISION,
         "embedding_version": config.version,
+        "feature_spec_version": REPOSITORY_FEATURE_SPEC_VERSION,
         "content_version": normalized_repo["content_version"],
         "content_hash": _string_field(
             repo.get("content_hash") or source_hash, "content_hash"
@@ -339,7 +343,7 @@ def build_vector_payload(
         "indexed_at": datetime.now(timezone.utc).isoformat(),
         "source_hash": _string_field(source_hash, "source_hash"),
     }
-    validate_repository_payload(payload)
+    validate_repository_payload(payload, require_serving_eligibility=False)
     return payload
 
 

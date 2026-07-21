@@ -13,3 +13,13 @@ __pycache__
 .cache
 tmp_pytest
 *.log
+*.tar.gz
+
+# Local/test/operator artifacts are not part of either online process. Qdrant
+# WAL files are sparse locally but expand the Docker build context by ~1 GiB.
+qdrant_storage
+tests
+deploy
+docs
+Ranking_Training_module
+ML_PROJECT_REVIEW_CHEAT_SHEET.md
