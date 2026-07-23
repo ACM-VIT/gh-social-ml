@@ -87,38 +87,6 @@ def filter_enriched(
     return kept, dropped
 
 
-def index_approved_repositories(
-    approved: list[Any],
-    *,
-    qdrant_url: str | None = None,
-    qdrant_api_key: str | None = None,
-    qdrant_collection: str | None = None,
-    embedding_model: str | None = None,
-) -> list[Any]:
-    """Embed approved repositories and persist their vectors to Qdrant."""
-    if not approved:
-        return []
-
-    from config import QDRANT_API_KEY, QDRANT_COLLECTION_NAME, QDRANT_URL
-    from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
-    from embedding.qdrant_store import QdrantRepositoryStore
-    from embedding.repository_embedding import RepositoryEmbeddingConfig
-
-    embedding_config = RepositoryEmbeddingConfig(
-        model_name=embedding_model
-        or os.getenv("EMBEDDING_MODEL")
-        or "all-MiniLM-L6-v2",
-    )
-    store = QdrantRepositoryStore(
-        url=qdrant_url or QDRANT_URL,
-        api_key=qdrant_api_key or QDRANT_API_KEY,
-        collection_name=qdrant_collection or QDRANT_COLLECTION_NAME,
-        vector_size=embedding_config.embedding_dim,
-    )
-    pipeline = RepositoryEmbeddingPipeline(config=embedding_config, store=store)
-    return pipeline.index_batch(approved)
-
-
 def _positive_int(value: str) -> int:
     try:
         number = int(value)
@@ -147,21 +115,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--corpus-target", type=_positive_int, default=None)
     parser.add_argument("--max-cycles", type=_positive_int, default=None)
     parser.add_argument("--checkpoint-path", type=Path, default=None)
-    parser.add_argument(
-        "--index-qdrant",
-        action="store_true",
-        help="Deprecated compatibility flag; indexing already runs by default",
-    )
-    parser.add_argument("--no-index-qdrant", action="store_true")
-    parser.add_argument("--qdrant-url", default=None)
-    parser.add_argument("--qdrant-api-key", default=None)
-    parser.add_argument("--qdrant-collection", default=None)
-    parser.add_argument("--embedding-model", default=None)
-    parser.add_argument(
-        "--allow-qdrant-without-postgres",
-        action="store_true",
-        help="Development only: permit indexing when Postgres is unavailable",
-    )
     parser.add_argument(
         "--validate-config",
         action="store_true",

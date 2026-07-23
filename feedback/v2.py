@@ -24,9 +24,17 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
 import numpy as np
+from dotenv import load_dotenv
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from qdrant_client.models import PointStruct
+
+# ``python -m feedback.v2`` is the documented local worker command. Load the
+# same project environment as the API before importing configuration constants
+# so both processes use one Redis/Qdrant/release contract. Library imports do
+# not load developer environment files into tests or embedding callers.
+if __name__ == "__main__":
+    load_dotenv()
 
 from embedding.qdrant_cas import payload_matches, payload_snapshot_filter
 from config import (
@@ -39,8 +47,8 @@ from embedding.vector_contract import (
     FEEDBACK_STATE_REVISION_FIELD,
     REPOSITORY_SERVING_ELIGIBILITY_FIELD,
     REPOSITORY_SERVING_ELIGIBILITY_VERSION,
-    repository_point_ids,
-    user_point_ids,
+    repository_point_id,
+    user_point_id,
 )
 from feedback.event_handlers import (
     ADJUSTMENTS_KEY,
@@ -852,28 +860,28 @@ class OrderedFeedbackApplier:
         return value
 
     def _user(self, user_id: str) -> Any:
-        canonical_user_id, legacy_user_id = user_point_ids(user_id)
+        canonical_user_id = user_point_id(user_id)
         try:
             users = self.qdrant.retrieve(
                 collection_name=self.settings.user_collection,
-                ids=[canonical_user_id, legacy_user_id],
+                ids=[canonical_user_id],
                 with_payload=True,
                 with_vectors=True,
             )
         except Exception as exc:
             raise FeedbackDependencyError() from exc
         users_by_id = {str(point.id): point for point in users}
-        user = users_by_id.get(canonical_user_id) or users_by_id.get(legacy_user_id)
+        user = users_by_id.get(canonical_user_id)
         if user is None:
             raise MissingVectorError("user")
         return user
 
     def _repository_vector(self, repo_id: str, dimension: int) -> np.ndarray:
-        canonical_repo_id, legacy_repo_id = repository_point_ids(repo_id)
+        canonical_repo_id = repository_point_id(repo_id)
         try:
             repos = self.qdrant.retrieve(
                 collection_name=self.settings.repository_collection,
-                ids=[canonical_repo_id, legacy_repo_id],
+                ids=[canonical_repo_id],
                 with_payload=[
                     "repo_id",
                     REPOSITORY_SERVING_ELIGIBILITY_FIELD,
@@ -889,7 +897,7 @@ class OrderedFeedbackApplier:
         except Exception as exc:
             raise FeedbackDependencyError() from exc
         repos_by_id = {str(point.id): point for point in repos}
-        repo = repos_by_id.get(canonical_repo_id) or repos_by_id.get(legacy_repo_id)
+        repo = repos_by_id.get(canonical_repo_id)
         if repo is None:
             raise MissingVectorError("repository")
         payload = self._payload(repo)

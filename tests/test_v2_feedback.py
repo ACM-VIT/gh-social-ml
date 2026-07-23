@@ -15,8 +15,6 @@ from config import (
 from embedding.vector_contract import (
     REPOSITORY_SERVING_ELIGIBILITY_FIELD,
     REPOSITORY_SERVING_ELIGIBILITY_VERSION,
-    legacy_repository_point_id,
-    legacy_user_point_id,
 )
 from feedback.event_handlers import ADJUSTMENTS_KEY, APPLIED_SIGNALS_KEY, LATENT_KEY
 from feedback.v2 import (
@@ -114,42 +112,6 @@ def test_feedback_applies_version_with_vector_in_one_upsert():
     point = client.upserts[0]["points"][0]
     assert point.payload["last_feedback_version"] == 1
     assert np.allclose(point.payload[LATENT_KEY], [0.85, 0.15])
-
-
-def test_feedback_reads_and_updates_pre_v2_uuid5_points():
-    user_id, repo_id = str(uuid.uuid4()), str(uuid.uuid4())
-    client = FakeQdrant(user_id, repo_id)
-    client.user.id = legacy_user_point_id(user_id)
-    legacy_repo_id = legacy_repository_point_id(repo_id)
-
-    def retrieve(collection_name, ids, with_payload, with_vectors):
-        if client.user.id in ids:
-            return [client.user]
-        assert legacy_repo_id in ids
-        return [
-            SimpleNamespace(
-                id=legacy_repo_id,
-                vector={"repo_embedding": [0.0, 1.0]},
-                payload={
-                    "repo_id": repo_id,
-                    REPOSITORY_SERVING_ELIGIBILITY_FIELD:
-                        REPOSITORY_SERVING_ELIGIBILITY_VERSION,
-                    "content_version": 1,
-                    "embedding_model": REPOSITORY_EMBEDDING_MODEL,
-                    "embedding_model_revision": EMBEDDING_MODEL_REVISION,
-                    "embedding_version": REPOSITORY_EMBEDDING_VERSION,
-                    "embedding_dim": 2,
-                    "feature_spec_version": REPOSITORY_FEATURE_SPEC_VERSION,
-                },
-            )
-        ]
-
-    client.retrieve = retrieve
-    result = OrderedFeedbackApplier(client).apply(event(user_id, repo_id, 1))
-
-    assert result.status == "applied"
-    assert client.upserts[0]["points"][0].id == legacy_user_point_id(user_id)
-    assert client.user.payload["last_feedback_version"] == 1
 
 
 def test_feedback_skips_duplicate_and_holds_version_gap():

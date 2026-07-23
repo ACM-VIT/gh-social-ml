@@ -130,7 +130,7 @@ eligible count above `MIN_ELIGIBLE_REPOSITORIES`. Points missing the pinned
 embedding revision or required feature-spec version must be reindexed through
 the backend outbox; do not weaken production eligibility to accept them. The
 same validated reindex must stamp
-`serving_eligibility_version=repository-vector-v1` atomically with the vector;
+`serving_eligibility_version=repository-vector-v2` atomically with the vector;
 never backfill that marker with a payload-only patch. See the production
 runbook for the coordinated cutover and the limits of write-time vector
 certification.

@@ -44,7 +44,7 @@ def test_corpus_config_validation_opens_no_network_connections(monkeypatch) -> N
         "requests.sessions.Session.request",
         side_effect=AssertionError("HTTP request attempted"),
     ):
-        result = corpus_main(["--validate-config", "--no-index-qdrant"])
+        result = corpus_main(["--validate-config"])
 
     assert result == 0
 
@@ -55,7 +55,7 @@ def test_corpus_config_validation_reports_missing_required_values(monkeypatch) -
     monkeypatch.delenv("INTERNAL_API_SECRET", raising=False)
     monkeypatch.setenv("CORPUS_TARGET_COUNT", "50000")
 
-    assert corpus_main(["--validate-config", "--no-index-qdrant"]) == 1
+    assert corpus_main(["--validate-config"]) == 1
 
 
 def test_trending_config_validation_does_not_start_worker(monkeypatch) -> None:

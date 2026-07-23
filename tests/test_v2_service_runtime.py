@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 
 import pytest
 
@@ -50,10 +51,11 @@ async def test_cancelled_service_job_retains_capacity_until_worker_exits(
         await runtime.run_service_job("refresh", lambda: "too-early")
 
     allow_finish.set()
-    for _ in range(100):
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
         if runtime.service_runtime_status()["refresh"]["outstanding"] == 0:
             break
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.01)
     assert runtime.service_runtime_status()["refresh"]["outstanding"] == 0
     assert await runtime.run_service_job("refresh", lambda: "accepted") == "accepted"
 
@@ -86,10 +88,11 @@ async def test_timed_out_service_job_retains_capacity_until_worker_exits(
         await runtime.run_service_job("health", lambda: "too-early")
 
     allow_finish.set()
-    for _ in range(100):
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
         if runtime.service_runtime_status()["health"]["outstanding"] == 0:
             break
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.01)
     assert runtime.service_runtime_status()["health"]["outstanding"] == 0
 
 

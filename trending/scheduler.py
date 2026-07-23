@@ -42,7 +42,7 @@ class TrendingScheduler:
                 a new fetcher will be created.
             storage: Delivery adapter. Production injects
                 ``BackendTrendingStorage``; the default PostgreSQL adapter is
-                retained only for legacy local compatibility.
+                retained only for local tests.
         """
         if not HAS_SCHEDULE:
             raise ImportError(

@@ -56,4 +56,4 @@ The Heavy Ranker evaluates the entire candidate pool before shaping or truncatio
 4. **Recommendation Response:** ML returns only unique `{repo_id, score, source}` items plus `schema_version`, `generation_id`, `user_id`, `feed_version`, `model_version`, and `embedding_version`.
 5. **Backend Serve:** The backend persists the feed serve and hydrates repository cards from PostgreSQL. ML never serves repository metadata directly to the frontend.
 
-The three internal 15-item batches remain a compatibility implementation detail for the existing v1 adapter. They are not the backend v2 wire contract.
+Candidate ranking is performed directly inside the canonical V2 retrieval pipeline. No earlier feed-batch adapter participates in serving.

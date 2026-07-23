@@ -119,10 +119,11 @@ def test_recommendation_context_reaches_retrieval_and_reports_serving_metadata(
     captured: list[object] = []
     batch = RecommendationBatch(
         items=[RankedRepository(str(uuid.uuid4()), 0.5, "fresh")],
-        model_version="qdrant-hybrid-v2",
-        embedding_version="repo-embedding-v1",
-        ranker_applied=False,
-        served_ranker="hybrid",
+        model_version="heavy-ranker-v2",
+        embedding_version="repo-embedding-v2",
+        ranker_applied=True,
+        served_ranker="heavy",
+        heavy_ranker_selected=True,
         retrieval_mode="cold_start_discovery",
     )
 
@@ -147,13 +148,25 @@ def test_recommendation_context_reaches_retrieval_and_reports_serving_metadata(
         )
 
     assert response.status_code == 200
-    assert captured[-1] is True
+    assert captured[-2] is True
+    assert captured[-1] == []
     assert response.json()["retrieval_mode"] == "cold_start_discovery"
-    assert response.json()["served_ranker"] == "hybrid"
+    assert response.json()["served_ranker"] == "heavy"
     assert response.json()["context_status"] == {
         "cold_start_applied": True,
         "locale": "reserved_unused",
     }
+
+
+def test_removed_v1_routes_cannot_be_reenabled(monkeypatch) -> None:
+    monkeypatch.setenv("LEGACY_ML_API_ENABLED", "true")
+    monkeypatch.setenv("INTERNAL_API_SECRET", "test-internal-secret")
+    response = TestClient(api_main.app).post(
+        "/api/v1/recommendations",
+        headers={"x-internal-secret": "test-internal-secret"},
+    )
+
+    assert response.status_code == 404
 
 
 def test_validation_errors_are_stable_and_request_ids_propagate(monkeypatch) -> None:
@@ -174,6 +187,20 @@ def test_validation_errors_are_stable_and_request_ids_propagate(monkeypatch) -> 
     assert response.json()["retryable"] is False
     assert response.json()["request_id"] == request_id
     assert response.json()["message"] == "Request validation failed."
+
+
+def test_validation_error_details_are_bounded(monkeypatch) -> None:
+    monkeypatch.setenv("INTERNAL_API_SECRET", "test-internal-secret")
+    response = TestClient(api_main.app).post(
+        "/api/v2/repositories/embed",
+        headers={"x-internal-secret": "test-internal-secret"},
+        json={f"unexpected_{index}": index for index in range(200)},
+    )
+
+    assert response.status_code == 422
+    details = response.json()["details"]
+    assert len(details) == api_main.MAX_VALIDATION_ERROR_DETAILS + 1
+    assert details[-1]["type"] == "validation_errors_omitted"
 
 
 def test_unsafe_request_id_is_replaced_before_logging(monkeypatch) -> None:
@@ -392,7 +419,6 @@ async def test_production_lifespan_fails_before_network_on_invalid_config(
     anyio_backend,
 ) -> None:
     monkeypatch.setenv("APP_ENV", "production")
-    monkeypatch.setenv("LEGACY_ML_API_ENABLED", "false")
     monkeypatch.delenv("REDIS_URL", raising=False)
     with pytest.raises(RuntimeError, match="Production configuration is invalid"):
         async with api_main.lifespan(api_main.app):

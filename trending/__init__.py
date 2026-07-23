@@ -9,7 +9,7 @@ Architecture:
 - scheduler: Manages 24-hour refresh scheduling
 - backend_storage: Publishes atomic snapshots to the backend; the backend outbox
   and ML refresh pipeline own Qdrant propagation
-- storage: Legacy local PostgreSQL adapter retained for non-production compatibility
+- storage: Local PostgreSQL test adapter; production uses backend_storage
 - config: Trending-specific configuration
 - logger: Centralized logging setup
 """

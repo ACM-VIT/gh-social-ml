@@ -66,15 +66,7 @@ def store():
 
 @pytest.fixture
 def retriever(store):
-    # A legacy connector can still be passed by the untouched retrieval engine,
-    # but the Qdrant-only retriever must neither retain nor call it.
-    forbidden_connector = MagicMock()
-    result = CandidateRetriever(
-        db_connector=forbidden_connector,
-        qdrant_store=store,
-    )
-    assert all(value is not forbidden_connector for value in result.__dict__.values())
-    return result
+    return CandidateRetriever(qdrant_store=store)
 
 
 def test_semantic_retrieval_is_approximate_and_returns_complete_candidate(retriever, store):
@@ -366,4 +358,3 @@ def test_person_three_retriever_contains_no_online_database_operations():
     source = inspect.getsource(module).lower()
     forbidden = ("postgres", "database.connector", "cursor.execute", "select ", "hydrate")
     assert not any(token in source for token in forbidden)
-    assert "db_connector" in source  # ignored compatibility shim only

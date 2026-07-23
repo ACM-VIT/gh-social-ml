@@ -1,17 +1,28 @@
 {
   "model_file": "heavy_ranker.pt",
   "scaler_file": "feature_scaler.json",
-  "model_version": "heavy-ranker-v1",
-  "embedding_version": "repo-embedding-v1",
+  "model_version": "heavy-ranker-v2",
+  "embedding_version": "repo-embedding-v2",
   "embedding_model": "all-MiniLM-L6-v2",
+  "embedding_model_revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
   "compatible_embedding_versions": [
-    "repo-embedding-v1",
     "repo-embedding-v2"
   ],
-  "feature_spec_version": "v1",
+  "feature_spec_version": "v2",
   "input_dim": 778,
   "embedding_dim": 384,
   "feature_count": 10,
+  "model_sha256": "ab7d804261bf204e51962192c26b445e058057993ddb67ff75cf32791cca9215",
+  "scaler_sha256": "3c168432741b1e58877692f9cd116a7362bc3a902e63154b88be5e0c2009c5ee",
+  "value_function_version": "v2",
+  "code_version": "heavy-ranker-runtime-v2",
+  "production_qualified": true,
+  "qualification_method": "manual_override",
+  "qualification_note": "Explicitly accepted for initial V2 deployment while real interaction telemetry is collected.",
+  "training_data": {
+    "identity": "Ranking_Training_module/data_generation/generate_mmoe_dataset.py@08bb5f7",
+    "type": "synthetic"
+  },
   "value_weights": {
     "ctr": 1.0,
     "save": 5.0,

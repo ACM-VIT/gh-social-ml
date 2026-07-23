@@ -26,7 +26,7 @@ class InteractionDefinition:
         """Whether the backend treats this as active product state.
 
         The online ML worker never persists product feedback; this property is
-        retained only for callers transitioning away from the legacy store.
+        retained only for callers transitioning to the V2 worker-owned state.
         """
         return self.state_family is not None and self.reversal_of is None
 

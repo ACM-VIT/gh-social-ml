@@ -21,7 +21,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 
 MAX_RESPONSE_BYTES = 1_000_000
-EXPECTED_SERVING_ELIGIBILITY_VERSION = "repository-vector-v1"
+EXPECTED_SERVING_ELIGIBILITY_VERSION = "repository-vector-v2"
 MINIMUM_QDRANT_SERVER_VERSION = (1, 18, 0)
 
 
@@ -191,18 +191,20 @@ def check_health(
     if configured_minimum != minimum:
         raise SmokeFailure("health corpus minimum does not match production config")
 
-    ranker_enabled = _boolean(env.get("V2_HEAVY_RANKER_ENABLED", "false"))
-    ranker_required = _boolean(env.get("V2_HEAVY_RANKER_REQUIRED", "false"))
+    ranker_enabled = _boolean(env.get("V2_HEAVY_RANKER_ENABLED", "true"))
+    ranker_required = _boolean(env.get("V2_HEAVY_RANKER_REQUIRED", "true"))
     if payload.get("heavy_ranker_enabled") is not ranker_enabled:
         raise SmokeFailure("health heavy-ranker enablement does not match production config")
     if payload.get("heavy_ranker_required") is not ranker_required:
         raise SmokeFailure("health heavy-ranker requirement does not match production config")
-    configured_traffic = float(env.get("V2_HEAVY_RANKER_TRAFFIC_PERCENT", "0"))
+    configured_traffic = float(env.get("V2_HEAVY_RANKER_TRAFFIC_PERCENT", "100"))
     reported_traffic = payload.get("heavy_ranker_traffic_percent")
     if isinstance(reported_traffic, bool) or not isinstance(reported_traffic, (int, float)):
         raise SmokeFailure("health heavy-ranker traffic percent is invalid")
     if not math.isclose(float(reported_traffic), configured_traffic, abs_tol=1e-9):
         raise SmokeFailure("health heavy-ranker traffic does not match production config")
+    if ranker_required and not math.isclose(configured_traffic, 100.0, abs_tol=1e-9):
+        raise SmokeFailure("required heavy ranker must receive 100 percent of traffic")
     if ranker_enabled:
         if payload.get("heavy_ranker_ready") is not True:
             raise SmokeFailure("enabled heavy ranker is not ready")
@@ -254,14 +256,20 @@ def check_recommendation(
         raise SmokeFailure("recommendation response user_id changed")
     if not _required_string(payload, "model_version"):
         raise SmokeFailure("recommendation response model version is missing")
-    if payload.get("served_ranker") not in {"hybrid", "heavy"}:
-        raise SmokeFailure("recommendation response served_ranker is invalid")
+    if payload.get("served_ranker") != "heavy":
+        raise SmokeFailure("production recommendation did not use the V2 heavy ranker")
     if payload.get("retrieval_mode") != "personalized":
         raise SmokeFailure("smoke user did not use its personalized profile vector")
     if not isinstance(payload.get("ranker_applied"), bool):
         raise SmokeFailure("recommendation response ranker_applied is invalid")
     if not isinstance(payload.get("heavy_ranker_selected"), bool):
         raise SmokeFailure("recommendation response heavy_ranker_selected is invalid")
+    if _boolean(env.get("V2_HEAVY_RANKER_REQUIRED", "true")) and (
+        payload.get("served_ranker") != "heavy"
+        or payload.get("ranker_applied") is not True
+        or payload.get("heavy_ranker_selected") is not True
+    ):
+        raise SmokeFailure("required heavy ranker did not serve the recommendation")
     fallback_code = payload.get("fallback_code")
     if fallback_code is not None and (
         not isinstance(fallback_code, str) or not fallback_code

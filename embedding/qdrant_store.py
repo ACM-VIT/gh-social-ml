@@ -122,9 +122,8 @@ class QdrantRepositoryStore:
 
         Qdrant evaluates the conditional filter atomically. Including the
         independent feature revision prevents an embedding worker that lost
-        its Redis lease from erasing a newer feature refresh. Existing legacy
-        point IDs are updated in place; online identity migration is unsafe
-        because Qdrant has no transaction spanning delete plus insert.
+        its Redis lease from erasing a newer feature refresh. Canonical point
+        IDs are updated in place under the V2 identity contract.
 
         Qdrant reports a filtered no-op as a completed operation, so this
         method returns a post-write read of the exact target for verification.

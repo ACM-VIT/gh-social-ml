@@ -91,13 +91,14 @@ class RecommendationRequest(StrictModel):
     feed_version: int = Field(ge=1)
     limit: int = Field(ge=1, le=100)
     exclude_repo_ids: list[uuid.UUID] = Field(default_factory=list, max_length=500)
+    social_repo_ids: list[uuid.UUID] = Field(default_factory=list, max_length=500)
     context: RecommendationContext
 
-    @field_validator("exclude_repo_ids")
+    @field_validator("exclude_repo_ids", "social_repo_ids")
     @classmethod
-    def unique_exclusions(cls, value: list[uuid.UUID]) -> list[uuid.UUID]:
+    def unique_repository_ids(cls, value: list[uuid.UUID]) -> list[uuid.UUID]:
         if len(set(value)) != len(value):
-            raise ValueError("exclude_repo_ids must be unique")
+            raise ValueError("repository ID lists must be unique")
         return value
 
 
@@ -158,15 +159,22 @@ class FeedbackBatch(StrictModel):
 
 
 class RepositorySource(StrictModel):
+    # These identity/source fields are supplied by the canonical Node v2
+    # ingestion outbox. ``repo_id`` is checked against the job envelope below;
+    # owner/name/node ID remain source metadata and are not used as Qdrant IDs.
+    repo_id: uuid.UUID | None = None
     github_id: str | None = Field(default=None, pattern=r"^[0-9]{1,32}$")
+    github_node_id: MediumText | None = None
     full_name: str = Field(min_length=3, max_length=256, pattern=r"^[^/\s]+/[^/\s]+$")
+    owner: ShortText | None = None
+    name: ShortText | None = None
     html_url: str | None = Field(
         default=None,
         max_length=2_048,
         validation_alias=AliasChoices("html_url", "url"),
     )
-    description: DescriptionText = ""
-    primary_language: ShortText = "Unknown"
+    description: DescriptionText | None = None
+    primary_language: ShortText | None = None
     languages: list[ListText] = Field(default_factory=list, max_length=100)
     topics: list[ListText] = Field(default_factory=list, max_length=200)
     readme: ReadmeText | None = None
@@ -187,11 +195,12 @@ class RepositorySource(StrictModel):
     created_at: datetime | None = None
     updated_at: datetime | None = None
     pushed_at: datetime | None = None
+    observed_at: datetime | None = None
     discovery_category: MediumText | None = None
     discovery_band: MediumText | None = None
     content_hash: str | None = Field(default=None, min_length=1, max_length=128)
 
-    @field_validator("created_at", "updated_at", "pushed_at")
+    @field_validator("created_at", "updated_at", "pushed_at", "observed_at")
     @classmethod
     def utc_timestamps(cls, value: datetime | None, info):
         return None if value is None else _utc(value, field_name=info.field_name)
@@ -217,6 +226,13 @@ class RepositoryJob(StrictModel):
     repo_id: uuid.UUID
     content_version: int = Field(ge=1)
     repository: RepositorySource
+
+    @model_validator(mode="after")
+    def matching_repository_identity(self):
+        nested_repo_id = self.repository.repo_id
+        if nested_repo_id is not None and nested_repo_id != self.repo_id:
+            raise ValueError("repository.repo_id must match repo_id")
+        return self
 
 
 class RepositoryFeaturePatch(StrictModel):

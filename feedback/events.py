@@ -17,7 +17,7 @@ class FeedbackEvent:
     repo_id: str
     action: str
     occurred_at: str
-    schema_version: int = 1
+    schema_version: int = 2
     dwell_seconds: float | None = None
 
     def __post_init__(self) -> None:
@@ -32,7 +32,7 @@ class FeedbackEvent:
         action = normalize_interaction(self.action)
         get_interaction(action)
         object.__setattr__(self, "action", action)
-        if self.schema_version != 1:
+        if self.schema_version != 2:
             raise ValueError("unsupported feedback schema_version")
         if action == "dwell":
             if self.dwell_seconds is None:
@@ -65,7 +65,7 @@ class FeedbackEvent:
             repo_id=str(payload.get("repo_id", "")),
             action=str(payload.get("action", "")),
             occurred_at=str(payload.get("occurred_at", "")),
-            schema_version=int(payload.get("schema_version", 1)),
+            schema_version=int(payload.get("schema_version", 2)),
             dwell_seconds=(
                 float(payload["dwell_seconds"])
                 if payload.get("dwell_seconds") not in (None, "") else None

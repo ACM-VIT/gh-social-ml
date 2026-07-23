@@ -314,7 +314,7 @@ async def test_consumer_acks_only_after_success(settings):
     payload = {
         "event_id": "evt", "user_id": USER_ID, "repo_id": REPO_ID,
         "action": "like", "occurred_at": datetime.now(timezone.utc).isoformat(),
-        "schema_version": "1",
+        "schema_version": "2",
     }
     await consumer._process_message("1-0", payload)
     handler.handle_feedback.assert_called_once()
@@ -386,88 +386,14 @@ async def test_same_user_messages_are_serialized(settings):
     assert maximum_active == 1
 
 
-def _event_payload(action="like", **updates):
-    payload = {
-        "event_id": str(uuid.uuid4()),
-        "user_id": USER_ID,
-        "repo_id": REPO_ID,
-        "action": action,
-        "occurred_at": datetime.now(timezone.utc).isoformat(),
-        "schema_version": 1,
-    }
-    payload.update(updates)
-    return payload
-
-
-def test_api_auth_and_feedback_contract(monkeypatch):
-    monkeypatch.setenv("INTERNAL_API_SECRET", "test-secret")
-    fake_producer = MagicMock()
-    fake_producer.submit_feedback = AsyncMock(return_value=True)
-    with patch.object(api_main, "producer", fake_producer):
-        client = TestClient(api_main.app)
-        assert client.post("/api/v1/feedback", json=_event_payload()).status_code == 401
-        response = client.post(
-            "/api/v1/feedback", json=_event_payload(),
-            headers={"x-internal-secret": "test-secret"},
-        )
-        assert response.status_code == 202
-        assert response.json()["data"]["queued_for_realtime_ml"] is True
-
-
 def test_every_non_health_route_is_guarded(monkeypatch):
     monkeypatch.setenv("INTERNAL_API_SECRET", "test-secret")
     client = TestClient(api_main.app)
     for route in api_main.app.routes:
         path = getattr(route, "path", "")
         methods = getattr(route, "methods", set())
-        if not path or path == "/api/v1/health":
+        if not path:
             continue
         method = "POST" if "POST" in methods else "GET"
         response = client.request(method, path)
         assert response.status_code == 401, path
-
-
-def test_impression_is_not_sent_to_realtime_stream(monkeypatch):
-    monkeypatch.setenv("INTERNAL_API_SECRET", "test-secret")
-    fake_producer = MagicMock()
-    fake_producer.submit_feedback = AsyncMock(return_value=True)
-    with patch.object(api_main, "producer", fake_producer):
-        response = TestClient(api_main.app).post(
-            "/api/v1/feedback", json=_event_payload("impression"),
-            headers={"x-internal-secret": "test-secret"},
-        )
-    assert response.status_code == 202
-    assert response.json()["data"]["queued_for_realtime_ml"] is False
-    fake_producer.submit_feedback.assert_not_called()
-
-
-def test_health_is_public_and_checks_real_dependencies(monkeypatch):
-    monkeypatch.delenv("INTERNAL_API_SECRET", raising=False)
-    fake_producer = SimpleNamespace(redis_client=MagicMock())
-    fake_producer.redis_client.ping.return_value = True
-    fake_consumer = SimpleNamespace(healthy=True)
-    fake_handler = MagicMock()
-    fake_handler.healthy.return_value = True
-    with patch.object(api_main, "producer", fake_producer), patch.object(
-        api_main, "consumer", fake_consumer
-    ), patch.object(api_main, "feedback_handler", fake_handler):
-        response = TestClient(api_main.app).get("/api/v1/health")
-    assert response.status_code == 200
-    assert all(response.json()["checks"].values())
-
-
-@pytest.mark.anyio
-async def test_lifespan_starts_without_database_url(monkeypatch):
-    monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.setenv("FEEDBACK_ALLOW_MEMORY_FALLBACK", "true")
-    fake_producer = SimpleNamespace(start=AsyncMock(), redis_client=None)
-    fake_consumer = SimpleNamespace(start=AsyncMock(), stop=AsyncMock())
-    fake_handler = SimpleNamespace(healthy=MagicMock(return_value=True), qdrant=SimpleNamespace())
-    with patch.object(
-        api_main, "_build_feedback_runtime",
-        return_value=(fake_producer, fake_consumer, fake_handler),
-    ):
-        async with api_main.lifespan(api_main.app):
-            assert "DATABASE_URL" not in __import__("os").environ
-            fake_consumer.start.assert_awaited_once()
-    fake_consumer.stop.assert_awaited_once()

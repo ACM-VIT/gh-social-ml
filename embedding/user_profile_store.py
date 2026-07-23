@@ -15,7 +15,7 @@ from .vector_contract import (
     USER_PROFILE_COLLECTION_CONTRACT,
     canonical_backend_uuid,
     user_point_id,
-    user_point_ids,
+    user_point_id,
     validate_embedding_vector,
 )
 
@@ -138,9 +138,8 @@ class QdrantUserProfileStore:
     ) -> bool:
         """Atomically replace a profile only if profile and feedback state match.
 
-        Existing legacy points are updated under their existing ID. Moving a
-        point online would require a non-atomic insert/delete pair and could
-        split feedback state across identities.
+        Existing canonical points are updated in place so profile and feedback
+        revisions remain protected by one compare-and-set operation.
         """
 
         canonical_user_id = canonical_backend_uuid(user_id, field_name="user_id")
@@ -200,7 +199,7 @@ class QdrantUserProfileStore:
                     FEEDBACK_STATE_REVISION_FIELD,
                 ),
             )
-            initializes_legacy_zero_cursor = (
+            initializes_zero_cursor = (
                 self._stored_version(desired_payload, "last_feedback_version") == 0
                 and self._stored_version(expected_payload, "last_feedback_version") == 0
                 and self._stored_version(
@@ -214,7 +213,7 @@ class QdrantUserProfileStore:
                 and desired_payload.get("last_feedback_event_id") is None
                 and expected_payload.get("last_feedback_event_id") is None
             )
-            if not cursor_matches and not initializes_legacy_zero_cursor:
+            if not cursor_matches and not initializes_zero_cursor:
                 raise ValueError(
                     "onboarding must preserve the observed feedback cursor"
                 )
@@ -257,25 +256,16 @@ class QdrantUserProfileStore:
         return raw
 
     def retrieve_user(self, user_id: str) -> Any | None:
-        """Read canonical or pre-v2 UUID5 state, preferring canonical state."""
-        canonical, legacy = user_point_ids(user_id)
+        """Read canonical V2 user state."""
+        canonical = user_point_id(user_id)
         points = self.client.retrieve(
             collection_name=self.contract.collection_name,
-            ids=[canonical, legacy],
+            ids=[canonical],
             with_payload=True,
             with_vectors=True,
         )
         by_id = {str(point.id): point for point in points}
-        return by_id.get(canonical) or by_id.get(legacy)
-
-    def delete_legacy_user(self, user_id: str) -> None:
-        """Delete the pre-v2 identity after a canonical upsert has succeeded."""
-        _, legacy = user_point_ids(user_id)
-        self.client.delete(
-            collection_name=self.contract.collection_name,
-            points_selector=[legacy],
-            wait=True,
-        )
+        return by_id.get(canonical)
 
     def _validated_user_point(
         self,

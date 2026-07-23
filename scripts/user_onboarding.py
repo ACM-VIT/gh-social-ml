@@ -307,9 +307,8 @@ class UserOnboardingPipeline:
                 stored_vector,
                 payload=user_payload,
             )
-        # Do not migrate a legacy point online: Qdrant cannot atomically insert
-        # the canonical point and delete the legacy identity while feedback is
-        # active. A coordinated offline migration must own that operation.
+        # V2 writes only the canonical point identity. Any pre-cutover identity
+        # cleanup is an offline administrative operation.
         return True
 
     def onboard_user(
