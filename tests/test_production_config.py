@@ -62,7 +62,7 @@ def valid_production_env() -> dict[str, str]:
         "QDRANT_API_KEY": "qdrant-test-key-strong",
         "QDRANT_TIMEOUT_SECONDS": "10",
         "QDRANT_DISTANCE": "Cosine",
-        "QDRANT_COLLECTION_NAME": "osiris_research_corpus",
+        "QDRANT_COLLECTION_NAME": "osiris_research_corpus_v2_20260722_r1",
         "QDRANT_VECTOR_NAME": "repo_embedding",
         "USER_PROFILES_COLLECTION": "user_profiles",
         "VECTOR_DIMENSION": "384",
@@ -221,6 +221,13 @@ def test_feedback_names_and_qdrant_auth_fail_closed() -> None:
     names = issue_names(environment)
 
     assert {"FEEDBACK_CONSUMER_HEARTBEAT_KEY", "QDRANT_AUTH_MODE", "QDRANT_API_KEY"} <= names
+
+
+def test_production_rejects_non_v2_repository_collection() -> None:
+    environment = valid_production_env()
+    environment["QDRANT_COLLECTION_NAME"] = "osiris_research_corpus"
+
+    assert "QDRANT_COLLECTION_NAME" in issue_names(environment)
 
 
 def test_redis_requires_authenticated_tls_and_image_identity_cannot_be_overridden() -> None:

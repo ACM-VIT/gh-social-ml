@@ -409,6 +409,14 @@ def _validate_vector_and_model(v: _Validator) -> None:
             v.issue("QDRANT_API_KEY", "must be a non-placeholder key of at least 16 bytes")
 
     repository_collection = v.name("QDRANT_COLLECTION_NAME")
+    if (
+        repository_collection is not None
+        and repository_collection != "osiris_research_corpus_v2_20260722_r1"
+    ):
+        v.issue(
+            "QDRANT_COLLECTION_NAME",
+            "must target the frozen strict-V2 repository corpus",
+        )
     v.number("QDRANT_TIMEOUT_SECONDS", minimum=0.1, maximum=120)
     distance = v.raw("QDRANT_DISTANCE", required=True)
     if distance is not None and distance.casefold() != "cosine":

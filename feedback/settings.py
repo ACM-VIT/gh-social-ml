@@ -118,7 +118,10 @@ class FeedbackSettings:
             dead_letter_stream=os.getenv("FEEDBACK_DEAD_LETTER_STREAM", "feedback_dead_letter"),
             qdrant_url=os.getenv("QDRANT_URL", "http://localhost:6333"),
             qdrant_api_key=os.getenv("QDRANT_API_KEY") or None,
-            repository_collection=os.getenv("QDRANT_COLLECTION_NAME", "osiris_research_corpus"),
+            repository_collection=os.getenv(
+                "QDRANT_COLLECTION_NAME",
+                "osiris_research_corpus_v2_20260722_r1",
+            ),
             repository_vector_name=os.getenv("QDRANT_VECTOR_NAME", "repo_embedding"),
             user_collection=os.getenv("USER_PROFILES_COLLECTION", "user_profiles"),
             user_vector_name=vector_name,

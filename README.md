@@ -48,7 +48,7 @@ GITHUB_TOKEN=github_pat_...
 DATABASE_URL=postgresql://user:password@localhost:5432/gh_social
 QDRANT_URL=http://localhost:6333
 QDRANT_API_KEY=
-QDRANT_COLLECTION_NAME=osiris_research_corpus
+QDRANT_COLLECTION_NAME=osiris_research_corpus_v2_20260722_r1
 REDIS_URL=redis://localhost:6379/0
 # Production requires exactly 64 lowercase hexadecimal characters:
 # openssl rand -hex 32

@@ -390,7 +390,8 @@ class V2FeedbackSettings:
                 minimum=0.1, maximum=120.0,
             ),
             repository_collection=_name(
-                "QDRANT_COLLECTION_NAME", default="osiris_research_corpus"
+                "QDRANT_COLLECTION_NAME",
+                default="osiris_research_corpus_v2_20260722_r1",
             ),
             repository_vector_name=_name("QDRANT_VECTOR_NAME", default="repo_embedding"),
             user_collection=_name("USER_PROFILES_COLLECTION", default="user_profiles"),
