@@ -54,7 +54,7 @@ REPOSITORY_COLLECTION_CONTRACT = VectorCollectionContract(
 # default hybrid path while still filtering to points written atomically by the
 # validated ingestion path.
 REPOSITORY_SERVING_ELIGIBILITY_FIELD = "serving_eligibility_version"
-REPOSITORY_SERVING_ELIGIBILITY_VERSION = "repository-vector-v1"
+REPOSITORY_SERVING_ELIGIBILITY_VERSION = "repository-vector-v2"
 
 # The existing user_profiles collection stores one unnamed vector per user.
 # Keeping that choice explicit prevents consumers from guessing a vector name.
@@ -109,33 +109,9 @@ def repository_point_id(repo_id: str) -> str:
     return canonical_backend_uuid(repo_id, field_name="repo_id")
 
 
-def legacy_repository_point_id(repo_id: str) -> str:
-    """Return the point ID emitted by the pre-v2 repository helper."""
-    canonical = canonical_backend_uuid(repo_id, field_name="repo_id")
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"github:{canonical}"))
-
-
-def repository_point_ids(repo_id: str) -> tuple[str, str]:
-    """Return canonical then legacy IDs for upgrade-safe reads."""
-    canonical = repository_point_id(repo_id)
-    return canonical, legacy_repository_point_id(canonical)
-
-
 def user_point_id(user_id: str) -> str:
     """Return the canonical backend user UUID used as the Qdrant point ID."""
     return canonical_backend_uuid(user_id, field_name="user_id")
-
-
-def legacy_user_point_id(user_id: str) -> str:
-    """Return the point ID emitted by the pre-v2 user helper."""
-    canonical = canonical_backend_uuid(user_id, field_name="user_id")
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"user:{canonical}"))
-
-
-def user_point_ids(user_id: str) -> tuple[str, str]:
-    """Return canonical then legacy IDs for upgrade-safe reads."""
-    canonical = user_point_id(user_id)
-    return canonical, legacy_user_point_id(canonical)
 
 
 def resolve_repository_identity(repo: Mapping[str, Any]) -> tuple[str, str]:

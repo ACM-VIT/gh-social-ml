@@ -15,7 +15,12 @@ query SearchRepositories($query: String!, $after: String) {
         databaseId
         nameWithOwner
         name
-        owner { login }
+        owner {
+          login
+          __typename
+          ... on User { databaseId }
+          ... on Organization { databaseId }
+        }
         stargazerCount
         description
         pushedAt
@@ -54,7 +59,12 @@ def build_batch_metadata_query(repos: list[tuple[str, str]]) -> str:
     pushedAt
     stargazerCount
     forkCount
-    owner {{ login __typename }}
+    owner {{
+      login
+      __typename
+      ... on User {{ databaseId }}
+      ... on Organization {{ databaseId }}
+    }}
     watchers {{ totalCount }}
     issues(states: OPEN) {{ totalCount }}
     pullRequests(states: OPEN) {{ totalCount }}
@@ -143,6 +153,12 @@ query GetRepository($owner: String!, $name: String!) {
     owner {
       login
       __typename
+      ... on User {
+        databaseId
+      }
+      ... on Organization {
+        databaseId
+      }
     }
     
     defaultBranchRef {

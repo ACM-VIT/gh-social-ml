@@ -175,10 +175,17 @@ def repository_upsert_record(source: Any) -> dict[str, Any]:
     ).strip()
     if not github_node_id:
         raise ValueError("github_node_id is required")
+    raw_owner = raw.get("owner") if isinstance(raw.get("owner"), dict) else {}
+    owner_github_id = str(
+        payload.get("owner_github_id") or raw_owner.get("github_id") or ""
+    ).strip()
+    if not owner_github_id.isdecimal() or int(owner_github_id) <= 0:
+        raise ValueError("owner_github_id must be a positive decimal string")
     readme = getattr(getattr(source, "readme", None), "clean_text", None)
     return {
         "github_id": github_id,
         "github_node_id": github_node_id,
+        "owner_github_id": owner_github_id,
         "full_name": full_name,
         "owner": owner,
         "name": name,

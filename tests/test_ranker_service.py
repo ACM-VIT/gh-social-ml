@@ -253,6 +253,37 @@ def test_synthetic_training_manifest_cannot_be_production_qualified(tmp_path):
         )
 
 
+def test_synthetic_manifest_can_be_explicitly_manually_qualified(tmp_path):
+    scaler_path = tmp_path / "feature_scaler.json"
+    model_path = tmp_path / "heavy_ranker.pt"
+    manifest_path = tmp_path / "model_manifest.json"
+    _write_scaler(scaler_path)
+    model_path.write_bytes(b"model-artifact")
+    _write_production_manifest(
+        manifest_path,
+        model_path=model_path,
+        scaler_path=scaler_path,
+        training_data={"identity": "generator-v1", "type": "synthetic"},
+        production_qualified=True,
+        qualification_method="manual_override",
+    )
+    state_dict = MMoEHeavyRanker(INPUT_DIM).state_dict()
+
+    with patch("inference.ranker_service.torch.load", return_value=state_dict):
+        service = RankerService(
+            model_path=str(model_path),
+            scaler_path=str(scaler_path),
+            manifest_path=str(manifest_path),
+            require_production_manifest=True,
+        )
+
+    assert service.production_qualified is True
+    assert service.qualification_overridden is True
+    assert "synthetic training data is not production-qualified" in (
+        service.qualification_errors
+    )
+
+
 def test_score_batch_empty_candidates_returns_empty(loaded_ranker_service):
     assert loaded_ranker_service.score_batch(
         np.zeros(384, dtype=np.float32),

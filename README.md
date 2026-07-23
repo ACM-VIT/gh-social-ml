@@ -6,12 +6,12 @@ Machine-learning and data-pipeline services for [gh-social](https://github.com/S
 
 - `acquisition/` and `ingestion/`: GitHub discovery, enrichment, classification, and quality filtering.
 - `embedding/`: SentenceTransformer repository embeddings and Qdrant indexing.
-- `retrieval/` and `retrieval_engine.py`: candidate retrieval, ranking, and recommendation batches.
+- `retrieval/v2_retriever.py`: canonical candidate retrieval, heavy ranking, and feed shaping.
 - `inference/`: learned ranking assets and final feed assembly.
 - `feedback/`: feedback queue producer, consumer, and embedding updates.
 - `trending/`: scheduled GitHub Trending ingestion.
 - `api/main.py`: the integrated internal FastAPI service.
-- `app.py`: a smaller standalone feed-assembly FastAPI service.
+- `app.py`: an alias for the canonical V2 ASGI application.
 - `Ranking_Training_module/`: training and synthetic-data utilities for the heavy ranker.
 - `tests/`: unit, integration, and benchmark coverage.
 
@@ -20,7 +20,7 @@ Machine-learning and data-pipeline services for [gh-social](https://github.com/S
 - Python 3.10 or newer
 - Qdrant for repository and user vectors
 - Redis for durable v2 feedback streaming
-- PostgreSQL only for transitional legacy paths and offline tooling
+- PostgreSQL only for offline acquisition and evaluation tooling
 - A GitHub personal access token for acquisition and trending ingestion
 
 Local development downloads the configured SentenceTransformer on first use.
@@ -48,7 +48,7 @@ GITHUB_TOKEN=github_pat_...
 DATABASE_URL=postgresql://user:password@localhost:5432/gh_social
 QDRANT_URL=http://localhost:6333
 QDRANT_API_KEY=
-QDRANT_COLLECTION_NAME=osiris_research_corpus
+QDRANT_COLLECTION_NAME=osiris_research_corpus_v2_20260722_r1
 REDIS_URL=redis://localhost:6379/0
 # Production requires exactly 64 lowercase hexadecimal characters:
 # openssl rand -hex 32
@@ -88,27 +88,8 @@ Its OpenAPI documentation is available at `http://127.0.0.1:8000/docs`.
 The protected endpoints fail closed when `INTERNAL_API_SECRET` is missing.
 Production requires exactly 64 lowercase hexadecimal characters generated with
 `openssl rand -hex 32`. Backend requests must send that exact value in the
-`X-Internal-Secret` header. The `/api/v1` routes remain transitional and are not
-the contract for new backend integrations.
-
-The standalone assembly service accepts exactly 15 pre-ranked candidates and returns their final repository-ID order:
-
-```bash
-uvicorn app:app --host 127.0.0.1 --port 8001 --reload
-```
-
-```http
-POST /api/internal/ml/assemble-feed
-Content-Type: application/json
-
-{
-  "candidates": [
-    { "repo_id": "repository-id", "final_score": 0.91 }
-  ]
-}
-```
-
-The request must contain 15 candidate objects. The response shape is `{ "rankedRepoIds": ["..."] }`.
+`X-Internal-Secret` header. The application exposes only `/api/v2` product
+endpoints; feed assembly is an internal stage of recommendation generation.
 
 ## Run The Pipelines
 
@@ -118,23 +99,11 @@ Discover, enrich, filter, and index repositories:
 python main.py --limit 150 --batch-size 15 --workers 4
 ```
 
-Skip Qdrant indexing when validating acquisition only:
-
-```bash
-python main.py --limit 30 --no-index-qdrant
-```
-
 Refresh GitHub Trending once or run the scheduler:
 
 ```bash
 python trending_service.py --once
 python trending_service.py --scheduled
-```
-
-Generate and inspect recommendation batches for onboarded users:
-
-```bash
-python retrieval_engine.py
 ```
 
 Additional evaluation, seeding, onboarding, and integration utilities are in `scripts/`. Run a script with `--help` before using it against shared infrastructure.
@@ -146,7 +115,7 @@ rollout gates are in the [V2 production operations runbook](docs/PRODUCTION_RUNB
 
 ## Schema Cutover Contract
 
-The v2 boundary keeps backend-owned product state in `app` and immutable delivery telemetry in `telemetry`. Some v1 code still reads or writes legacy tables such as `user_recommendation_batches` and accepts direct feedback; it is retained only during the coordinated rollout.
+The V2 boundary keeps backend-owned product state in `app` and immutable delivery telemetry in `telemetry`. Online ML uses only Redis and Qdrant and accepts versioned backend-owned jobs.
 
 New work must follow these boundaries:
 
@@ -155,11 +124,11 @@ New work must follow these boundaries:
 - Store typed recommendation entries in Redis with repository ID, score, source, model version, and summary ID.
 - Record only the feed slice actually served, with `serve_id`, `session_id`, ordered positions, source, and model version.
 - Preserve the original interaction event type. Do not reduce events to a calculated feedback score before they are stored.
-- Consume backend-created ML outbox records with idempotency keys and retry semantics. Direct fire-and-forget feedback delivery is transitional and must be removed.
+- Consume backend-created ML outbox records with idempotency keys and retry semantics.
 - Ignore quick passive swipes. The coordinated client/backend contract records an impression after one second of visibility and dwell after three seconds.
 - Do not recreate a standalone `user_feedback` table. Current state belongs in reactions and saves; immutable events and derived per-user/repository rollups belong in telemetry.
 
-The cutover must be deployed together with the gh-social database, backend, and Expo changes. Keep legacy tables read-only during the rollback window and remove them only after feed, authentication, social actions, boards, and ML delivery have been verified.
+Deploy the ML service together with the matching gh-social backend and Expo V2 contracts. Run the production smoke test before shifting traffic.
 
 ## Production Processes
 
@@ -178,7 +147,7 @@ terminal events are preserved in a bounded DLQ, and replay is dry-run by
 default. V2 readiness fails closed when the consumer heartbeat, stream health,
 collection contracts, pinned embedding identity, model warmup, or eligible
 corpus minimum is unhealthy. Repository eligibility also requires the indexed
-`repository-vector-v1` serving marker, stamped only when the ML store validates
+`repository-vector-v2` serving marker, stamped only when the ML store validates
 and atomically upserts the repository vector and payload.
 
 Production starts from [`deploy/production.env.example`](deploy/production.env.example)
@@ -209,12 +178,17 @@ still share project modules and one `uv.lock`; the online import-graph tests
 enforce that database code is not imported, and the deployment validator
 prevents database credentials from entering the containers.
 
-The checked-in heavy ranker was trained on synthetic interactions and is not a
-production-qualified artifact. Broad production therefore defaults to
-`qdrant-hybrid-v2` with `V2_HEAVY_RANKER_ENABLED=false` and traffic percent `0`.
-A future qualified artifact must pass manifest/provenance checks and progress
-through shadow evaluation and a small deterministic canary. Traffic percent
-`0` is the immediate ranking rollback.
+Production configuration uses `V2_HEAVY_RANKER_ENABLED=true`,
+`V2_HEAVY_RANKER_REQUIRED=true`, and traffic percent `100`. In that mode every
+request with an onboarding profile traverses V2 semantic/discovery retrieval,
+the heavy ranker, social adjustment, and feed assembly. A missing user vector,
+unavailable model, or invalid heavy-ranker output fails the request with a
+retryable dependency error; it is never served by the hybrid ranking fallback.
+The checked-in heavy ranker was trained on synthetic interactions and carries
+an explicit manual production qualification for the initial V2 launch. The
+manifest preserves that provenance and exposes the automatic qualification
+warnings; replace it with a telemetry-trained artifact once real interactions
+are available.
 
 Main-branch deployments use a non-cancelling concurrency group and the GitHub
 `production` environment. Repository administrators must configure required

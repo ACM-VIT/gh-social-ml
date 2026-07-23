@@ -7,7 +7,6 @@ from embedding.vector_contract import (
 
 SEMANTIC_LIMIT = 130
 DISCOVERY_LIMIT = 20
-# Backward-compatible alias for callers that still display the old label.
 TRENDING_LIMIT = DISCOVERY_LIMIT
 TOTAL_CANDIDATE_POOL = 150
 OVERFETCH_MULTIPLIER = 1.5
@@ -55,13 +54,3 @@ FALLBACK_REPOS = (
     "denoland/deno",
     "supabase/supabase",
 )
-
-# Temporary compatibility exports for the current retrieval_engine.py, which
-# is owned by the ranking/feed workstream. CandidateRetriever does not import
-# or use these values; they can be removed when that owner replaces the old
-# cold-start path with Qdrant discovery.
-COLD_START_SKILL_MATCH_LIMIT = 60
-COLD_START_TRENDING_LIMIT = 30
-COLD_START_MIN_STARS = 0
-COLD_START_SKILL_WEIGHT = 0.6
-COLD_START_STARS_WEIGHT = 0.4

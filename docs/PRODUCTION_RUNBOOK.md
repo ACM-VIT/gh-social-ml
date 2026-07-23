@@ -19,7 +19,7 @@ Do not expose the service broadly until all of these are true:
    profile, and feedback versions.
 2. Repository points have the configured embedding model, pinned revision,
    embedding version, dimension, content version, feature-spec version, and
-   `serving_eligibility_version=repository-vector-v1` certification.
+   `serving_eligibility_version=repository-vector-v2` certification.
 3. The eligible repository count is at least `MIN_ELIGIBLE_REPOSITORIES`.
 4. The dedicated smoke user is onboarded and can receive at least one result.
 5. Redis and both Qdrant collection contracts pass authenticated V2 health.
@@ -70,7 +70,7 @@ purpose and production rule.
 
 | Group | Variables | Production rule |
 | --- | --- | --- |
-| Boundary/auth | `APP_ENV`, `LEGACY_ML_API_ENABLED`, `V2_FEEDBACK_CONSUMER_REQUIRED`, `INTERNAL_API_HEADER`, `INTERNAL_API_SECRET` | Exactly `production`, `false`, `true`, `x-internal-secret`, and a unique secret of exactly 64 lowercase hexadecimal characters. Generate it independently per environment with `openssl rand -hex 32`. |
+| Boundary/auth | `APP_ENV`, `V2_FEEDBACK_CONSUMER_REQUIRED`, `INTERNAL_API_HEADER`, `INTERNAL_API_SECRET` | Exactly `production`, `true`, `x-internal-secret`, and a unique secret of exactly 64 lowercase hexadecimal characters. Generate it independently per environment with `openssl rand -hex 32`. |
 | Redis stream | `REDIS_AUTH_MODE=acl_url`, credential-bearing `REDIS_URL`, `FEEDBACK_STREAM_NAME`, `FEEDBACK_STREAM_MAXLEN`, `FEEDBACK_CONSUMER_GROUP`, `FEEDBACK_CONSUMER_PREFIX`, `FEEDBACK_IDEMPOTENCY_TTL_SECONDS` | Redis 6.2+ over authenticated TLS only. Use a least-privilege ACL principal scoped to the documented stream, lock, dedupe, heartbeat, attempt, and replay keys/commands. The exact maximum counts outstanding work; new events receive retryable backpressure at capacity. ACK/source deletion and DLQ transfer are atomic. |
 | Consumer | `FEEDBACK_READ_BATCH_SIZE`, `FEEDBACK_READ_BLOCK_MS`, `FEEDBACK_RECLAIM_IDLE_MS`, `FEEDBACK_MAX_DELIVERY_ATTEMPTS`, `FEEDBACK_CONSUMER_HEARTBEAT_KEY`, `FEEDBACK_CONSUMER_HEARTBEAT_TTL_SECONDS` | Bounded reads/reclaims; required heartbeat. |
 | User lock | `FEEDBACK_USER_LOCK_PREFIX`, `FEEDBACK_USER_LOCK_TTL_SECONDS`, `FEEDBACK_USER_LOCK_WAIT_SECONDS`, `FEEDBACK_USER_LOCK_RENEW_INTERVAL_SECONDS` | One namespace for onboarding and feedback; renewal is less than half the TTL. |
@@ -81,7 +81,7 @@ purpose and production rule.
 | Embedding | `EMBEDDING_MODEL`, `EMBEDDING_MODEL_REVISION`, `REPOSITORY_EMBEDDING_VERSION`, `V2_COMPATIBLE_EMBEDDING_VERSIONS`, `REPOSITORY_FEATURE_SPEC_VERSION`, `V2_REQUIRED_FEATURE_SPEC_VERSION`, `V2_REQUIRED_CONTENT_VERSION`, `V2_ALLOW_MISSING_EMBEDDING_REVISION`, `README_CHUNK_CHARS`, `README_CHUNK_OVERLAP_CHARS` | Exact baked model/revision; explicit compatible versions; missing revision is forbidden in production; chunking is bounded. |
 | Readiness | `MIN_ELIGIBLE_REPOSITORIES` | Must be a positive capacity chosen for the launch market, not merely `1` for convenience. |
 | Model runtime | `EMBEDDING_WARMUP_ON_STARTUP`, `EMBEDDING_MAX_CONCURRENCY`, `EMBEDDING_EXECUTOR_WORKERS`, `EMBEDDING_CPU_THREADS`, `HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE` | Warmup and offline flags are true; concurrency is bounded. |
-| Ranking | `ML_MODEL_VERSION`, `V2_HEAVY_RANKER_ENABLED`, `V2_HEAVY_RANKER_REQUIRED`, `V2_HEAVY_RANKER_TRAFFIC_PERCENT`, `V2_HEAVY_RANKER_CANARY_SALT`, `V2_ALLOW_UNQUALIFIED_HEAVY_RANKER`, `V2_EXPLORATION_FRACTION`, `V2_MAX_SAME_LANGUAGE` | Hybrid is the broad default; unqualified artifacts are forbidden; traffic is deterministic and bounded. |
+| Ranking | `ML_MODEL_VERSION`, `V2_HEAVY_RANKER_ENABLED`, `V2_HEAVY_RANKER_REQUIRED`, `V2_HEAVY_RANKER_TRAFFIC_PERCENT`, `V2_HEAVY_RANKER_CANARY_SALT`, `V2_ALLOW_UNQUALIFIED_HEAVY_RANKER`, `V2_EXPLORATION_FRACTION`, `V2_MAX_SAME_LANGUAGE` | Unqualified artifacts are forbidden. Required-heavy mode mandates 100% traffic and fails closed rather than serving the hybrid ranker. |
 | Service isolation | `V2_RECOMMENDATION_TIMEOUT_SECONDS`, `V2_RECOMMENDATION_EXECUTOR_WORKERS`, `V2_RECOMMENDATION_MAX_OUTSTANDING`; the `V2_FEEDBACK_*`, `V2_REFRESH_*`, and `V2_HEALTH_*` executor-worker, max-outstanding, and timeout variables | Recommendations, feedback mutation, repository refresh, and health work use separate bounded executors with fail-fast admission. Capacity includes running and queued work. Timed-out work retains capacity until it really exits; do not raise limits without host-specific load and dependency-failure tests. |
 | Repository jobs | `REPOSITORY_JOB_LOCK_TTL_MS`, `REPOSITORY_JOB_LOCK_WAIT_SECONDS` | Renewable lock TTL exceeds wait time. |
 | Deployment smoke | `ML_SMOKE_USER_ID`, `ML_SMOKE_RECOMMENDATION_LIMIT`, `ML_SMOKE_EXPECT_MIN_ITEMS`, `ML_SMOKE_TIMEOUT_SECONDS` | Dedicated, onboarded, non-human user; bounded read-only recommendation smoke. |
@@ -121,7 +121,7 @@ The serving eligibility marker is a write-time certification, not a live
 per-request proof of vector presence. `QdrantRepositoryStore.upsert` rejects a
 caller-supplied marker, validates the vector and pre-serving payload, then
 atomically writes that vector with
-`serving_eligibility_version=repository-vector-v1`. Hybrid recommendation
+`serving_eligibility_version=repository-vector-v2`. Hybrid recommendation
 queries filter and count that indexed marker without transferring repository
 vectors. This keeps the default serving path bounded, but it relies on Qdrant
 write credentials being restricted to the validated ML ingestion path. Do not
@@ -495,7 +495,7 @@ state as described above.
 | Eligible corpus | Near minimum | Below minimum | Pause deployment; reindex incompatible points. |
 | Empty/short feeds | Sustained above baseline | Smoke user below minimum or user-facing spike | Check eligibility filters, exclusions, and Qdrant errors. |
 | Heavy fallback | Above canary baseline | Sustained model/dependency fallback | Set traffic to `0`; inspect bounded reason counters. |
-| Recommendation latency | p95/p99 budget breach | Sustained SLO breach | Set heavy traffic to `0`, check Qdrant, executor saturation, CPU and memory. |
+| Recommendation latency | p95/p99 budget breach | Sustained SLO breach | Roll back the release; check Qdrant, executor saturation, CPU and memory. |
 | Embedding jobs | Queue/latency growth | Recommendation starvation or host pressure | Keep concurrency bounded; scale workers only after measurement. |
 
 Logs must include request/event/job identifiers and stable status/error codes,
@@ -504,36 +504,38 @@ or raw dependency exceptions.
 
 ## Heavy-ranker promotion
 
-The checked-in model was trained on synthetic interactions and is deliberately
-not production-qualified. Keep these settings for broad rollout:
+Production is configured as strict V2 heavy-only:
 
 ```dotenv
-V2_HEAVY_RANKER_ENABLED=false
-V2_HEAVY_RANKER_REQUIRED=false
-V2_HEAVY_RANKER_TRAFFIC_PERCENT=0
+V2_HEAVY_RANKER_ENABLED=true
+V2_HEAVY_RANKER_REQUIRED=true
+V2_HEAVY_RANKER_TRAFFIC_PERCENT=100
 V2_ALLOW_UNQUALIFIED_HEAVY_RANKER=false
 ```
 
-A replacement artifact requires real telemetry identity, immutable model and
+The checked-in model was trained on synthetic interactions and is deliberately
+not production-qualified, so this configuration blocks deployment until it is
+replaced. A replacement artifact requires real telemetry identity, immutable model and
 scaler hashes, pinned embedding model/revision and compatible versions,
 feature/value-function versions, training timestamp, code version, offline
 ranking metrics, calibration metrics, and slice evaluation. Promote it through
-offline evaluation, shadow comparison, a small deterministic canary, monitored
-ramps, and only then broad traffic. Set traffic to `0` for immediate rollback;
-do not retrain or relabel synthetic data as production data.
+offline evaluation and shadow comparison before replacing the production
+artifact. Required-heavy serving fails closed when
+the onboarding vector or heavy result is unavailable; it never silently serves
+the hybrid ranker. Roll back the complete release instead of enabling hybrid
+traffic; do not retrain or relabel synthetic data as production data.
 
 ## Rollout sequence
 
 1. **Staging:** exercise authenticated backend -> API -> Redis -> consumer ->
    Qdrant and verify DLQ/replay with disposable identities.
-2. **Shadow/hybrid:** serve hybrid only; collect real evaluation telemetry and
-   compare any candidate heavy ranker without affecting order.
-3. **Small deterministic canary:** enable a production-qualified artifact for a
-   small stable traffic percentage; watch quality, calibration, fallback,
-   latency, empty feeds, lag, and DLQ.
-4. **Monitored ramp:** increase in explicit steps with a hold period and rollback
-   criterion at each step.
-5. **Broad rollout:** proceed only after SLOs and quality slices remain healthy.
+2. **Offline/shadow evaluation:** collect real evaluation telemetry and compare
+   the candidate heavy ranker without exposing an unqualified artifact.
+3. **Qualified staging:** install the production-qualified artifact with strict
+   heavy-only flags and watch quality, calibration, latency, empty feeds, lag,
+   and DLQ.
+4. **Production release:** deploy the same immutable artifact and roll back the
+   complete release if any gate fails.
 
 No component can guarantee zero latency. The goal is bounded work and no
 meaningful hot-path regression: shared warmed models, isolated embedding work,

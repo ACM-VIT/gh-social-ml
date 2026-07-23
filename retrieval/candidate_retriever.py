@@ -56,23 +56,17 @@ class CandidateRetriever:
     ``retrieval_score``
         Similarity for semantic results; ordered-channel value otherwise.
 
-    Payload fields are also copied to the candidate's top level for backward
-    compatibility with the current ranker. The nested ``payload`` remains the
-    canonical metadata object.
+    Payload fields are also copied to the candidate's top level for the ranker.
+    The nested ``payload`` remains the canonical metadata object.
     """
 
     def __init__(
         self,
-        db_connector: Any = None,
         qdrant_url: str | None = None,
         qdrant_api_key: str | None = None,
         *,
         qdrant_store: Any = None,
     ) -> None:
-        # Kept as an ignored compatibility argument until retrieval_engine.py
-        # is updated by its owner. No database object is retained or used.
-        del db_connector
-
         self._qdrant_store = qdrant_store
         self._qdrant_available = qdrant_store is not None
 

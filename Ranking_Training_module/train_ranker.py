@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
-from datetime import date
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -28,7 +29,11 @@ from inference.feature_spec import (  # noqa: E402
 )
 from inference.ranker_service import MMoEHeavyRanker  # noqa: E402
 from inference.value_function import VALUE_WEIGHTS  # noqa: E402
-from config import REPOSITORY_EMBEDDING_VERSION  # noqa: E402
+from config import (  # noqa: E402
+    EMBEDDING_MODEL_REVISION,
+    REPOSITORY_EMBEDDING_MODEL,
+    REPOSITORY_EMBEDDING_VERSION,
+)
 
 
 DATA_KEYS = (
@@ -184,6 +189,41 @@ def evaluate(
     return total_loss / total_examples
 
 
+def calibration_metrics(
+    model: MMoEHeavyRanker,
+    data_loader: DataLoader,
+    device: torch.device,
+) -> dict[str, float]:
+    """Compute validation Brier/MSE metrics for artifact qualification."""
+    names = ("ctr", "save", "github_open", "dwell", "follow")
+    squared_error = {name: 0.0 for name in names}
+    total_examples = 0
+    model.eval()
+    with torch.no_grad():
+        for batch in data_loader:
+            x, *targets = (tensor.to(device) for tensor in batch)
+            predictions = [value.reshape(-1) for value in model(x)]
+            for name, prediction, target in zip(names, predictions, targets):
+                squared_error[name] += float(
+                    torch.sum((prediction - target.reshape(-1)) ** 2).item()
+                )
+            total_examples += int(x.shape[0])
+    if total_examples == 0:
+        raise ValueError("Validation split is empty")
+    return {
+        f"{name}_brier" if name != "dwell" else "dwell_mse": value / total_examples
+        for name, value in squared_error.items()
+    }
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as artifact:
+        for block in iter(lambda: artifact.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def train(
     *,
     data_path: str | Path,
@@ -192,6 +232,9 @@ def train(
     batch_size: int,
     output_dir: str | Path,
     model_version: str = RANKER_MODEL_VERSION,
+    training_data_identity: str | None = None,
+    training_data_type: str = "synthetic",
+    code_version: str = "heavy-ranker-runtime-v2",
 ) -> dict[str, object]:
     """Train the heavy ranker and write its production artifacts."""
     if epochs <= 0:
@@ -203,6 +246,17 @@ def train(
     if not isinstance(model_version, str) or not model_version.strip():
         raise ValueError("model_version must be a non-empty string")
     model_version = model_version.strip()
+    if training_data_type not in {"synthetic", "real_telemetry"}:
+        raise ValueError("training_data_type must be synthetic or real_telemetry")
+    training_data_identity = (
+        str(training_data_identity).strip()
+        if training_data_identity is not None
+        else Path(data_path).name
+    )
+    if not training_data_identity:
+        raise ValueError("training_data_identity must be non-empty")
+    if not isinstance(code_version, str) or not code_version.strip():
+        raise ValueError("code_version must be a non-empty string")
 
     arrays = load_training_data(data_path)
     scaled_dense, scaler_mean, scaler_scale = standardize_dense_features(
@@ -285,20 +339,35 @@ def train(
         + "\n",
         encoding="utf-8",
     )
+    calibration = calibration_metrics(model, val_loader, device)
     manifest = {
         "model_file": model_path.name,
         "scaler_file": scaler_path.name,
         "model_version": model_version,
         "embedding_version": REPOSITORY_EMBEDDING_VERSION,
+        "embedding_model": REPOSITORY_EMBEDDING_MODEL,
+        "embedding_model_revision": EMBEDDING_MODEL_REVISION,
+        "compatible_embedding_versions": [REPOSITORY_EMBEDDING_VERSION],
         "feature_spec_version": FEATURE_SPEC_VERSION,
         "input_dim": INPUT_DIM,
         "embedding_dim": EMBEDDING_DIM,
         "feature_count": FEATURE_COUNT,
+        "model_sha256": _sha256(model_path),
+        "scaler_sha256": _sha256(scaler_path),
+        "value_function_version": "v2",
+        "code_version": code_version.strip(),
         "value_weights": VALUE_WEIGHTS,
-        "training_date": date.today().isoformat(),
+        "training_data": {
+            "identity": training_data_identity,
+            "type": training_data_type,
+        },
+        "training_timestamp": datetime.now(timezone.utc).isoformat(),
+        "offline_metrics": {
+            "final_train_loss": final_train_loss,
+            "final_validation_loss": final_val_loss,
+        },
+        "calibration_metrics": calibration,
         "epochs": epochs,
-        "final_train_loss": final_train_loss,
-        "final_val_loss": final_val_loss,
     }
     manifest_path.write_text(
         json.dumps(manifest, indent=2) + "\n",
@@ -319,6 +388,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--output-dir", default="inference/")
     parser.add_argument("--model-version", default=RANKER_MODEL_VERSION)
+    parser.add_argument("--training-data-identity", default=None)
+    parser.add_argument(
+        "--training-data-type",
+        choices=("synthetic", "real_telemetry"),
+        default="synthetic",
+    )
+    parser.add_argument("--code-version", default="heavy-ranker-runtime-v2")
     return parser.parse_args()
 
 
@@ -331,6 +407,9 @@ def main() -> None:
         batch_size=args.batch_size,
         output_dir=args.output_dir,
         model_version=args.model_version,
+        training_data_identity=args.training_data_identity,
+        training_data_type=args.training_data_type,
+        code_version=args.code_version,
     )
 
 

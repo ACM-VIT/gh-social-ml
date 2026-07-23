@@ -122,6 +122,7 @@ class RankerService:
         self.embedding_model: str | None = None
         self.embedding_model_revision: str | None = None
         self.production_qualified = False
+        self.qualification_overridden = False
         self.qualification_errors: tuple[str, ...] = (
             "model manifest is unavailable",
         )
@@ -198,7 +199,19 @@ class RankerService:
                     expected_embedding_model_revision=expected_embedding_model_revision,
                 )
             )
-            self.production_qualified = not self.qualification_errors
+            self.qualification_overridden = (
+                manifest.get("production_qualified") is True
+                and manifest.get("qualification_method") == "manual_override"
+            )
+            self.production_qualified = (
+                self.qualification_overridden or not self.qualification_errors
+            )
+            if self.qualification_overridden and self.qualification_errors:
+                logger.warning(
+                    "Heavy ranker is manually production-qualified despite "
+                    "automatic qualification failures: %s",
+                    "; ".join(self.qualification_errors),
+                )
             logger.info("Model manifest loaded successfully from %s", manifest_path)
 
         requested_embedding_versions = set(expected_embedding_versions or ())

@@ -53,6 +53,7 @@ def _source():
             "full_name": "owner/repo",
             "github_id": "123",
             "github_node_id": "R_kg_test",
+            "owner_github_id": "456",
             "html_url": "https://github.com/owner/repo",
             "description": "demo",
             "primary_language": "Python",
@@ -74,6 +75,7 @@ def test_repository_record_keeps_source_and_backend_identity_fields_separate():
 
     assert record["github_id"] == "123"
     assert record["github_node_id"] == "R_kg_test"
+    assert record["owner_github_id"] == "456"
     assert record["full_name"] == "owner/repo"
     assert "repo_id" not in record
     assert record["url"] == "https://github.com/owner/repo"

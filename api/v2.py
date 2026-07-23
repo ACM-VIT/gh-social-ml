@@ -41,7 +41,7 @@ from embedding.runtime import (
 )
 from embedding.user_profile_store import QdrantUserProfileStore
 from embedding.vector_contract import (
-    repository_point_ids,
+    repository_point_id,
     validate_repository_payload,
 )
 from scripts.user_onboarding import UserProfileWriteConflict
@@ -258,10 +258,10 @@ def shutdown_v2_runtime() -> None:
 
 
 def _repository_points(repo_id: str) -> list[Any]:
-    canonical, legacy = repository_point_ids(repo_id)
+    canonical = repository_point_id(repo_id)
     return retriever().client.retrieve(
         collection_name=retriever().repository_collection,
-        ids=[canonical, legacy],
+        ids=[canonical],
         with_payload=True,
         with_vectors=False,
     )
@@ -308,7 +308,7 @@ def _repository_job_status(
 
 
 def _single_repository_point(points: list[Any]) -> Any | None:
-    """Reject split canonical/legacy state instead of updating it non-atomically."""
+    """Return the single canonical repository point."""
 
     distinct = {str(point.id): point for point in points}
     if len(distinct) > 1:
@@ -461,16 +461,7 @@ def _embed_repository_job_locked(request: RepositoryJob, lock: Any) -> dict[str,
             "content_version": current,
         }
 
-    payload = request.repository.model_dump(mode="json")
-    readme = payload.pop("readme", None)
-    if readme is not None:
-        payload["extracted_paragraphs"] = [readme]
-        payload["readme_length"] = len(readme)
-    payload.update({
-        "id": repo_id,
-        "repo_id": repo_id,
-        "content_version": request.content_version,
-    })
+    payload = _repository_embedding_payload(request)
     pipeline = repository_embedding_pipeline()
     result = pipeline.embed_repository(payload)
     result.payload["content_job_id"] = job_id
@@ -507,6 +498,24 @@ def _embed_repository_job_locked(request: RepositoryJob, lock: Any) -> dict[str,
         "content_version": final_version,
         "embedding_version": result.embedding_version,
     }
+
+
+def _repository_embedding_payload(request: RepositoryJob) -> dict[str, Any]:
+    payload = request.repository.model_dump(mode="json")
+    # The backend source contract permits null GitHub values. The embedding
+    # payload contract publishes deterministic, non-null serving values.
+    payload["description"] = payload.get("description") or ""
+    payload["primary_language"] = payload.get("primary_language") or "Unknown"
+    readme = payload.pop("readme", None)
+    if readme is not None:
+        payload["extracted_paragraphs"] = [readme]
+        payload["readme_length"] = len(readme)
+    payload.update({
+        "id": str(request.repo_id),
+        "repo_id": str(request.repo_id),
+        "content_version": request.content_version,
+    })
+    return payload
 
 
 def _refresh_repository_job(request: RepositoryRefreshJob) -> dict[str, Any]:
@@ -684,6 +693,7 @@ async def generate_recommendations(
             [str(item) for item in request.exclude_repo_ids],
             str(request.generation_id),
             request.context.cold_start,
+            [str(item) for item in request.social_repo_ids],
         )
     except HTTPException:
         raise
@@ -724,7 +734,7 @@ async def generate_recommendations(
         "model_version": batch.model_version,
         "embedding_version": batch.embedding_version,
         "embedding_versions": list(getattr(batch, "embedding_versions", ())),
-        "served_ranker": getattr(batch, "served_ranker", "hybrid"),
+        "served_ranker": getattr(batch, "served_ranker", "heavy"),
         "heavy_ranker_selected": getattr(batch, "heavy_ranker_selected", False),
         "ranker_applied": batch.ranker_applied,
         "fallback_code": getattr(batch, "fallback_code", None),
@@ -863,7 +873,7 @@ async def health(request: Request):
         embedding = embedding_runtime_status()
         consumer_required = os.getenv(
             "V2_FEEDBACK_CONSUMER_REQUIRED",
-            "true" if os.getenv("APP_ENV", "development").lower() == "production" else "false",
+            "true",
         ).strip().lower() in {"1", "true", "yes", "on"}
         if consumer_required and not redis.get("feedback_consumer_active"):
             raise RuntimeError("V2 feedback consumer heartbeat is missing")

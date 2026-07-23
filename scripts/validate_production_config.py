@@ -409,6 +409,14 @@ def _validate_vector_and_model(v: _Validator) -> None:
             v.issue("QDRANT_API_KEY", "must be a non-placeholder key of at least 16 bytes")
 
     repository_collection = v.name("QDRANT_COLLECTION_NAME")
+    if (
+        repository_collection is not None
+        and repository_collection != "osiris_research_corpus_v2_20260722_r1"
+    ):
+        v.issue(
+            "QDRANT_COLLECTION_NAME",
+            "must target the frozen strict-V2 repository corpus",
+        )
     v.number("QDRANT_TIMEOUT_SECONDS", minimum=0.1, maximum=120)
     distance = v.raw("QDRANT_DISTANCE", required=True)
     if distance is not None and distance.casefold() != "cosine":
@@ -434,7 +442,11 @@ def _validate_vector_and_model(v: _Validator) -> None:
             "VECTOR_DIMENSION",
             "must be 384 for the configured all-MiniLM-L6-v2 collection contract",
         )
-    v.boolean("V2_USER_COLLECTION_REQUIRED")
+    if v.boolean("V2_USER_COLLECTION_REQUIRED") is not True:
+        v.issue(
+            "V2_USER_COLLECTION_REQUIRED",
+            "must be true in strict V2 production",
+        )
 
     model = v.raw("EMBEDDING_MODEL", required=True)
     if model is not None and _looks_like_placeholder(model):
@@ -559,6 +571,16 @@ def _validate_vector_and_model(v: _Validator) -> None:
 def _validate_ranker_and_retrieval(v: _Validator) -> None:
     enabled = v.boolean("V2_HEAVY_RANKER_ENABLED")
     required = v.boolean("V2_HEAVY_RANKER_REQUIRED")
+    if enabled is not True:
+        v.issue(
+            "V2_HEAVY_RANKER_ENABLED",
+            "must be true in strict V2 production",
+        )
+    if required is not True:
+        v.issue(
+            "V2_HEAVY_RANKER_REQUIRED",
+            "must be true so production cannot serve the fallback ranker",
+        )
     if v.boolean("V2_ALLOW_UNQUALIFIED_HEAVY_RANKER") is not False:
         v.issue(
             "V2_ALLOW_UNQUALIFIED_HEAVY_RANKER",
@@ -567,6 +589,11 @@ def _validate_ranker_and_retrieval(v: _Validator) -> None:
     traffic = v.number(
         "V2_HEAVY_RANKER_TRAFFIC_PERCENT", minimum=0, maximum=100
     )
+    if traffic is not None and traffic != 100:
+        v.issue(
+            "V2_HEAVY_RANKER_TRAFFIC_PERCENT",
+            "must be 100 in strict V2 production",
+        )
     if traffic is not None and traffic > 0 and enabled is not True:
         v.issue(
             "V2_HEAVY_RANKER_TRAFFIC_PERCENT",
@@ -576,6 +603,11 @@ def _validate_ranker_and_retrieval(v: _Validator) -> None:
         v.issue(
             "V2_HEAVY_RANKER_REQUIRED",
             "cannot be true when V2_HEAVY_RANKER_ENABLED is false",
+        )
+    if required and traffic is not None and traffic != 100:
+        v.issue(
+            "V2_HEAVY_RANKER_TRAFFIC_PERCENT",
+            "must be 100 when V2_HEAVY_RANKER_REQUIRED is true",
         )
     v.raw("ML_MODEL_VERSION", required=True)
     v.name("V2_HEAVY_RANKER_CANARY_SALT")
@@ -697,10 +729,6 @@ def validate_production_config(
             validator.issue("ML_RELEASE_ID", "must match the immutable image release ID")
 
     validator.exact("APP_ENV", "production")
-    if validator.boolean("LEGACY_ML_API_ENABLED") is not False:
-        validator.issue(
-            "LEGACY_ML_API_ENABLED", "must be false in production"
-        )
     if validator.boolean("V2_FEEDBACK_CONSUMER_REQUIRED") is not True:
         validator.issue(
             "V2_FEEDBACK_CONSUMER_REQUIRED",

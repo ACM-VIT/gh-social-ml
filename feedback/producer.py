@@ -73,7 +73,7 @@ class FeedbackProducer:
         *,
         event_id: str,
         occurred_at: str,
-        schema_version: int = 1,
+        schema_version: int = 2,
         dwell_seconds: float | None = None,
     ) -> bool:
         return await self.submit(

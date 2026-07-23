@@ -16,8 +16,8 @@ def payload_snapshot_filter(
     """Match one point and the exact scalar payload snapshot for ``fields``.
 
     Missing and null values use ``IsEmptyCondition`` instead of being coerced
-    to a default. That distinction is part of the fencing token: a legacy
-    point with no cursor must not match a cursor initialized after the read.
+    to a default. That distinction is part of the fencing token: a point with
+    no cursor must not match a cursor initialized after the read.
     """
 
     conditions: list[Any] = [models.HasIdCondition(has_id=[point_id])]

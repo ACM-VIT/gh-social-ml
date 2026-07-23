@@ -11,7 +11,7 @@ import numpy as np
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct
 
-from embedding.vector_contract import repository_point_ids, user_point_ids
+from embedding.vector_contract import repository_point_id, user_point_id
 
 from .interactions import get_interaction, normalize_interaction
 from .settings import FeedbackSettings
@@ -106,7 +106,7 @@ def _point_vector(
 
 
 def _payload_mapping(payload: Mapping[str, Any], key: str) -> dict[str, Any]:
-    """Return a mutable payload mapping or reject corrupted legacy state."""
+    """Return a mutable payload mapping or reject corrupted state."""
     value = payload.get(key, {})
     if not isinstance(value, Mapping):
         raise ValueError(f"{key} must be an object")
@@ -222,7 +222,7 @@ class FeedbackHandler:
             raise
         except Exception as exc:
             logger.error(
-                "Legacy feedback event failed error_type=%s",
+                "Feedback event failed error_type=%s",
                 type(exc).__name__,
             )
             return False
@@ -236,10 +236,10 @@ class FeedbackHandler:
         dwell_seconds: float | None,
     ) -> bool:
         definition = get_interaction(action)
-        canonical_user_id, legacy_user_id = user_point_ids(user_id)
+        canonical_user_id = user_point_id(user_id)
         user_points = self.qdrant.retrieve(
             collection_name=self.settings.user_collection,
-            ids=[canonical_user_id, legacy_user_id],
+            ids=[canonical_user_id],
             with_payload=True,
             with_vectors=True,
         )
@@ -248,7 +248,7 @@ class FeedbackHandler:
             return False
 
         points_by_id = {str(candidate.id): candidate for candidate in user_points}
-        point = points_by_id.get(canonical_user_id) or points_by_id.get(legacy_user_id)
+        point = points_by_id.get(canonical_user_id)
         if point is None:
             logger.warning("User profile %s is not available yet", user_id)
             return False
@@ -368,10 +368,10 @@ class FeedbackHandler:
         return True
 
     def _repository_vector(self, repo_id: str) -> list[float] | None:
-        canonical_repo_id, legacy_repo_id = repository_point_ids(repo_id)
+        canonical_repo_id = repository_point_id(repo_id)
         points = self.qdrant.retrieve(
             collection_name=self.settings.repository_collection,
-            ids=[canonical_repo_id, legacy_repo_id],
+            ids=[canonical_repo_id],
             with_payload=False,
             with_vectors=True,
         )
@@ -379,7 +379,7 @@ class FeedbackHandler:
             logger.warning("Repository vector %s is not available", repo_id)
             return None
         points_by_id = {str(point.id): point for point in points}
-        point = points_by_id.get(canonical_repo_id) or points_by_id.get(legacy_repo_id)
+        point = points_by_id.get(canonical_repo_id)
         if point is None:
             logger.warning("Repository vector %s is not available", repo_id)
             return None

@@ -1,6 +1,14 @@
 import hmac
 import os
 
+from dotenv import load_dotenv
+
+
+# Load local development configuration before freezing module-level contracts.
+# Existing process environment variables still take precedence.
+load_dotenv()
+
+V2_REPOSITORY_COLLECTION_NAME = "osiris_research_corpus_v2_20260722_r1"
 
 def internal_api_header_name() -> str:
     """Return the normalized service-auth header shared by every API layer."""
@@ -58,7 +66,7 @@ NOVELTY_THRESHOLD               = 0.35
 TOP_K_COMPARISONS               = 5
 EMBEDDING_MODEL                 = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 EMBEDDING_DIM                   = _positive_int_env("VECTOR_DIMENSION", 384)
-COLLECTION_NAME                 = "osiris_research_corpus"
+COLLECTION_NAME                 = V2_REPOSITORY_COLLECTION_NAME
 QDRANT_VECTOR_NAME              = os.getenv("QDRANT_VECTOR_NAME", "repo_embedding")
 USER_PROFILES_COLLECTION_NAME   = os.getenv(
     "USER_PROFILES_COLLECTION", "user_profiles"
@@ -93,9 +101,9 @@ NOVELTY_WEIGHTS = {
 # targets without editing source code.
 REPOSITORY_EMBEDDING_MODEL = EMBEDDING_MODEL
 REPOSITORY_EMBEDDING_DIM = EMBEDDING_DIM
-REPOSITORY_EMBEDDING_VERSION = os.getenv("REPOSITORY_EMBEDDING_VERSION", "repo-embedding-v1")
+REPOSITORY_EMBEDDING_VERSION = os.getenv("REPOSITORY_EMBEDDING_VERSION", "repo-embedding-v2")
 REPOSITORY_FEATURE_SPEC_VERSION = os.getenv(
-    "REPOSITORY_FEATURE_SPEC_VERSION", "v1"
+    "REPOSITORY_FEATURE_SPEC_VERSION", "v2"
 ).strip()
 if not REPOSITORY_FEATURE_SPEC_VERSION:
     raise ValueError("REPOSITORY_FEATURE_SPEC_VERSION must be non-empty")
@@ -123,7 +131,14 @@ REPO_TOWER_WEIGHTS = {
 # validation commands.
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY") or None
-QDRANT_COLLECTION_NAME = os.getenv("QDRANT_COLLECTION_NAME", COLLECTION_NAME)
+QDRANT_COLLECTION_NAME = os.getenv(
+    "QDRANT_COLLECTION_NAME", COLLECTION_NAME
+).strip()
+if QDRANT_COLLECTION_NAME != V2_REPOSITORY_COLLECTION_NAME:
+    raise ValueError(
+        "QDRANT_COLLECTION_NAME must target the strict V2 repository corpus "
+        f"{V2_REPOSITORY_COLLECTION_NAME!r}; got {QDRANT_COLLECTION_NAME!r}"
+    )
 QDRANT_DISTANCE = os.getenv("QDRANT_DISTANCE", "Cosine")
 QDRANT_PAYLOAD_INDEX_SCHEMA = {
     "repo_id": "keyword",

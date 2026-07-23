@@ -18,8 +18,6 @@ from embedding.user_profile_store import QdrantUserProfileStore
 from embedding.vector_contract import (
     FEEDBACK_STATE_REVISION_FIELD,
     USER_PROFILE_COLLECTION_CONTRACT,
-    legacy_repository_point_id,
-    legacy_user_point_id,
     repository_point_id,
     user_point_id,
 )
@@ -187,26 +185,6 @@ def test_feature_refresh_fences_a_content_holder_that_would_erase_it() -> None:
     assert stale_result.payload["activity_score"] == 0.9
 
 
-def test_repository_legacy_point_is_updated_in_place_without_online_migration() -> None:
-    client, store = _repository_store()
-    legacy_id = legacy_repository_point_id(REPO_ID)
-    client.upsert(
-        store.collection_name,
-        [store._validated_point(_repository_result(1, _job()), point_id=legacy_id)],
-        wait=True,
-    )
-    legacy_snapshot = _repository_point(client, store, legacy_id)
-
-    result = store.compare_and_set_content(
-        _repository_result(2, _job()),
-        expected_point=legacy_snapshot,
-    )
-
-    assert str(result.id) == legacy_id
-    assert result.payload["content_version"] == 2
-    assert client.retrieve(store.collection_name, [repository_point_id(REPO_ID)]) == []
-
-
 def _user_store() -> tuple[QdrantClient, QdrantUserProfileStore]:
     client = QdrantClient(":memory:")
     store = QdrantUserProfileStore(client=client)
@@ -288,8 +266,6 @@ def test_feedback_cursor_change_fences_stale_onboarding() -> None:
     assert final.payload["last_feedback_version"] == 1
     assert final.payload["last_feedback_event_id"] == feedback_event_id
     assert final.vector == _vector(1)
-
-
 def test_rejection_finalization_fences_stale_onboarding_snapshot() -> None:
     client, store = _user_store()
     initial_job = _job()
@@ -376,38 +352,3 @@ def test_stale_onboarding_holder_cannot_overwrite_newer_profile() -> None:
     assert final.payload["profile_version"] == 3
     assert final.payload["job_id"] == newest_job
     assert final.vector == _vector(1)
-
-
-def test_user_legacy_point_is_updated_in_place_without_online_migration() -> None:
-    client, store = _user_store()
-    legacy_id = legacy_user_point_id(USER_ID)
-    initial_job = _job()
-    client.upsert(
-        USER_PROFILE_COLLECTION_CONTRACT.collection_name,
-        [
-            models.PointStruct(
-                id=legacy_id,
-                vector=_vector(),
-                payload={
-                    "user_id": USER_ID,
-                    "profile_version": 1,
-                    "job_id": initial_job,
-                    "topics": ["legacy-profile"],
-                },
-            )
-        ],
-        wait=True,
-    )
-    legacy_snapshot = _user_point(client, legacy_id)
-
-    assert store.compare_and_set_user(
-        USER_ID,
-        _vector(1),
-        payload=_user_payload(2, _job()),
-        expected_point=legacy_snapshot,
-    )
-    assert _user_point(client, legacy_id).payload["profile_version"] == 2
-    assert client.retrieve(
-        USER_PROFILE_COLLECTION_CONTRACT.collection_name,
-        [user_point_id(USER_ID)],
-    ) == []

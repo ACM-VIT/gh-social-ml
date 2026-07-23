@@ -35,8 +35,7 @@ from embedding.vector_contract import (
     REPOSITORY_SERVING_ELIGIBILITY_FIELD,
     REPOSITORY_SERVING_ELIGIBILITY_VERSION,
     USER_PROFILE_COLLECTION_CONTRACT,
-    legacy_repository_point_id,
-    user_point_ids,
+    user_point_id,
     validate_embedding_vector,
 )
 from inference.feed_assembly import FeedAssemblySystem
@@ -63,6 +62,11 @@ _DISCOVERY_SOURCES = {
     "popularity": "popular",
     "freshness": "fresh",
 }
+
+SOCIAL_BOOST_FRACTION = 0.05
+SOCIAL_BOOST_MIN = 0.005
+SOCIAL_BOOST_MAX = 0.03
+SOCIAL_BOOSTED_BATCH_FRACTION = 0.25
 
 # Keep the recommendation hot path independent of the potentially larger
 # feedback ledger stored on the same user point. These are the only profile
@@ -150,6 +154,7 @@ class QdrantV2Retriever:
         assembler: FeedAssemblySystem | None = None,
         ranker: RankerService | None = None,
         heavy_ranker_enabled: bool | None = None,
+        heavy_ranker_required: bool | None = None,
         heavy_ranker_traffic_percent: float | None = None,
         compatible_embedding_versions: set[str] | None = None,
         minimum_eligible_repositories: int | None = None,
@@ -239,20 +244,25 @@ class QdrantV2Retriever:
         self.minimum_eligible_repositories = minimum_eligible_repositories
         self.user_collection_required = self._boolean_env(
             "V2_USER_COLLECTION_REQUIRED",
-            default=self.app_env == "production",
+            default=True,
         )
 
+        heavy_ranker_explicitly_disabled = heavy_ranker_enabled is False
         if heavy_ranker_enabled is None:
             heavy_ranker_enabled = self._boolean_env(
-                "V2_HEAVY_RANKER_ENABLED", default=False
+                "V2_HEAVY_RANKER_ENABLED", default=True
             )
         self.heavy_ranker_enabled = heavy_ranker_enabled
         if heavy_ranker_traffic_percent is None:
-            heavy_ranker_traffic_percent = self._float_env(
-                "V2_HEAVY_RANKER_TRAFFIC_PERCENT",
-                default=0.0,
-                minimum=0.0,
-                maximum=100.0,
+            heavy_ranker_traffic_percent = (
+                self._float_env(
+                    "V2_HEAVY_RANKER_TRAFFIC_PERCENT",
+                    default=100.0,
+                    minimum=0.0,
+                    maximum=100.0,
+                )
+                if self.heavy_ranker_enabled
+                else 0.0
             )
         if not 0.0 <= float(heavy_ranker_traffic_percent) <= 100.0:
             raise ValueError("heavy_ranker_traffic_percent must be between 0 and 100")
@@ -261,16 +271,26 @@ class QdrantV2Retriever:
             raise ValueError(
                 "V2_HEAVY_RANKER_TRAFFIC_PERCENT must be 0 when the heavy ranker is disabled"
             )
-        self.heavy_ranker_required = self._boolean_env(
-            "V2_HEAVY_RANKER_REQUIRED", default=False
-        )
+        if heavy_ranker_required is None:
+            heavy_ranker_required = (
+                False
+                if heavy_ranker_explicitly_disabled
+                else self._boolean_env(
+                    "V2_HEAVY_RANKER_REQUIRED", default=self.heavy_ranker_enabled
+                )
+            )
+        self.heavy_ranker_required = heavy_ranker_required
         if self.heavy_ranker_required and not self.heavy_ranker_enabled:
             raise ValueError(
                 "V2_HEAVY_RANKER_REQUIRED cannot be true while the heavy ranker is disabled"
             )
+        if self.heavy_ranker_required and self.heavy_ranker_traffic_percent != 100.0:
+            raise ValueError(
+                "V2_HEAVY_RANKER_TRAFFIC_PERCENT must be 100 when the heavy ranker is required"
+            )
         if allow_unqualified_ranker is None:
             allow_unqualified_ranker = self._boolean_env(
-                "V2_ALLOW_UNQUALIFIED_HEAVY_RANKER", default=False
+                "V2_ALLOW_UNQUALIFIED_HEAVY_RANKER", default=True
             )
         if allow_unqualified_ranker and self.app_env == "production":
             raise ValueError(
@@ -307,12 +327,12 @@ class QdrantV2Retriever:
                 ranker_version = str(
                     getattr(self.ranker, "model_version", "heavy-ranker-unknown")
                 )
-                self.heavy_model_version = f"{ranker_version}-v2-adapter"
+                self.heavy_model_version = ranker_version
             except Exception as exc:
                 self.ranker = None
                 self.ranker_error = "heavy ranker initialization failed"
                 logger.error(
-                    "V2 heavy ranker initialization failed; hybrid fallback remains active "
+                    "V2 heavy ranker initialization failed "
                     "error_type=%s",
                     type(exc).__name__,
                 )
@@ -390,9 +410,8 @@ class QdrantV2Retriever:
             canonical = str(uuid.UUID(candidate))
         except (ValueError, AttributeError):
             return None
-        valid_point_ids = {canonical, legacy_repository_point_id(canonical)}
         has_canonical_payload = str(payload.get("repo_id")) == canonical
-        return canonical if str(point.id) in valid_point_ids and has_canonical_payload else None
+        return canonical if str(point.id) == canonical and has_canonical_payload else None
 
     @staticmethod
     def _vector(value: Any, preferred: str | None = None) -> list[float] | None:
@@ -536,17 +555,17 @@ class QdrantV2Retriever:
         return eligible
 
     def _user_profile(self, user_id: str) -> tuple[list[float] | None, dict[str, Any]]:
-        canonical, legacy = user_point_ids(user_id)
+        canonical = user_point_id(user_id)
         points = self.client.retrieve(
             collection_name=self.user_collection,
-            ids=[canonical, legacy],
+            ids=[canonical],
             with_vectors=True,
             with_payload=_USER_RETRIEVAL_PAYLOAD_FIELDS,
         )
         if not points:
             return None, {}
         by_id = {str(point.id): point for point in points}
-        point = by_id.get(canonical) or by_id.get(legacy)
+        point = by_id.get(canonical)
         if not point:
             return None, {}
         payload = dict(point.payload or {})
@@ -809,7 +828,7 @@ class QdrantV2Retriever:
             )
         except Exception as exc:
             logger.error(
-                "V2 heavy ranking failed for one request; using hybrid fallback",
+                "V2 heavy ranking failed for one request",
                 extra={
                     "ranking_context": {"error_type": type(exc).__name__}
                 },
@@ -835,11 +854,13 @@ class QdrantV2Retriever:
         heavy_selected: bool,
         ranker_applied: bool,
         fallback_code: str | None,
+        served: bool = True,
     ) -> None:
         keys = ["requests_total"]
         if heavy_selected:
             keys.append("heavy_selected")
-        keys.append("heavy_served" if ranker_applied else "hybrid_served")
+        if served:
+            keys.append("heavy_served" if ranker_applied else "hybrid_served")
         if fallback_code in _FALLBACK_MESSAGES:
             keys.append(f"fallback_{fallback_code.casefold()}")
         with self._counter_lock:
@@ -873,6 +894,42 @@ class QdrantV2Retriever:
             return versions[0], versions
         return f"compatible-mixed:{','.join(versions)}", versions
 
+    @staticmethod
+    def _apply_social_boost(
+        ranked: list[RankedRepository],
+        social_repo_ids: set[str],
+        limit: int,
+    ) -> list[RankedRepository]:
+        """Apply a small, capped boost after ranking without injecting candidates."""
+        if not ranked or not social_repo_ids or limit <= 0:
+            return ranked
+        eligible = [item for item in ranked if item.repo_id in social_repo_ids]
+        if not eligible:
+            return ranked
+
+        output_size = min(limit, len(ranked))
+        boost_cap = max(1, int(output_size * SOCIAL_BOOSTED_BATCH_FRACTION))
+        boosted_ids = {item.repo_id for item in eligible[:boost_cap]}
+        scores = [item.score for item in ranked]
+        score_span = max(scores) - min(scores)
+        boost = min(
+            SOCIAL_BOOST_MAX,
+            max(SOCIAL_BOOST_MIN, score_span * SOCIAL_BOOST_FRACTION),
+        )
+        positions = {item.repo_id: index for index, item in enumerate(ranked)}
+        adjusted = [
+            RankedRepository(
+                repo_id=item.repo_id,
+                score=item.score + boost if item.repo_id in boosted_ids else item.score,
+                source=item.source,
+            )
+            for item in ranked
+        ]
+        return sorted(
+            adjusted,
+            key=lambda item: (-item.score, positions[item.repo_id]),
+        )
+
     def recommend_batch(
         self,
         user_id: str,
@@ -880,6 +937,7 @@ class QdrantV2Retriever:
         exclude_repo_ids: list[str],
         generation_seed: str | None = None,
         cold_start: bool = False,
+        social_repo_ids: list[str] | None = None,
     ) -> RecommendationBatch:
         excluded = {str(uuid.UUID(item)) for item in exclude_repo_ids}
         candidates: dict[str, RankedRepository] = {}
@@ -889,7 +947,11 @@ class QdrantV2Retriever:
             tuple[str, bool], _EligibleRepositoryPoint | None
         ] = {}
         user_vector, user_profile = self._user_profile(user_id)
-        heavy_selected = self._heavy_ranker_selected(user_id) and not cold_start
+        heavy_selected = self._heavy_ranker_selected(user_id)
+        if self.heavy_ranker_required and not heavy_selected:
+            raise RetrievalDependencyError(
+                "the required V2 heavy ranker was not selected"
+            )
         include_candidate_vectors = bool(
             heavy_selected and self.ranker is not None and user_vector is not None
         )
@@ -976,9 +1038,6 @@ class QdrantV2Retriever:
         hybrid_ranked = sorted(
             candidates.values(), key=lambda item: (-item.score, item.repo_id)
         )[: self.max_candidates]
-        # Cold-start profile vectors are useful for semantic retrieval, but the
-        # interaction-trained heavy ranker is intentionally bypassed until the
-        # backend marks the user as established.
         heavy_ranked: list[RankedRepository] | None = None
         fallback_code: str | None = None
         fallback_reason: str | None = None
@@ -990,8 +1049,24 @@ class QdrantV2Retriever:
                 metadata=metadata,
                 vectors=vectors,
             )
+        if self.heavy_ranker_required and heavy_ranked is None:
+            self._record_ranking_result(
+                heavy_selected=heavy_selected,
+                ranker_applied=False,
+                fallback_code=fallback_code,
+                served=False,
+            )
+            raise RetrievalDependencyError(
+                "the required V2 heavy ranker could not serve this request: "
+                f"{fallback_reason or 'unknown ranker failure'}"
+            )
         ranker_applied = heavy_ranked is not None
         ranked = heavy_ranked if heavy_ranked is not None else hybrid_ranked
+        ranked = self._apply_social_boost(
+            ranked,
+            {str(uuid.UUID(repo_id)) for repo_id in (social_repo_ids or [])},
+            limit,
+        )
         model_version = (
             self.heavy_model_version
             if ranker_applied and self.heavy_model_version
@@ -1055,6 +1130,7 @@ class QdrantV2Retriever:
         exclude_repo_ids: list[str],
         generation_seed: str | None = None,
         cold_start: bool = False,
+        social_repo_ids: list[str] | None = None,
     ) -> list[RankedRepository]:
         """Compatibility wrapper returning only the recommendation items."""
         return self.recommend_batch(
@@ -1063,6 +1139,7 @@ class QdrantV2Retriever:
             exclude_repo_ids,
             generation_seed,
             cold_start,
+            social_repo_ids,
         ).items
 
     @staticmethod

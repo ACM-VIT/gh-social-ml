@@ -2,7 +2,6 @@ import logging
 import random
 from dotenv import load_dotenv
 
-from database.connector import PostgreSQLConnector
 from retrieval.candidate_retriever import CandidateRetriever
 
 # Setup logging
@@ -12,14 +11,8 @@ logger = logging.getLogger("demo.retrieval")
 def main():
     load_dotenv()
     
-    logger.info("Initializing database connector...")
-    db = PostgreSQLConnector()
-    if not db.enabled or not db.verify_connection():
-        logger.error("PostgreSQL is not running or not configured properly. Check DATABASE_URL in .env.")
-        return
-        
     logger.info("Initializing CandidateRetriever...")
-    retriever = CandidateRetriever(db_connector=db)
+    retriever = CandidateRetriever()
     
     # Generate a random 384-dimensional normalized vector for the mock user persona
     random.seed(42)

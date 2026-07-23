@@ -19,7 +19,6 @@ PINNED_REVISION = "c9745ed1d9f207416be6d2e6f8de32d1f16199bf"
 def valid_production_env() -> dict[str, str]:
     return {
         "APP_ENV": "production",
-        "LEGACY_ML_API_ENABLED": "false",
         "V2_FEEDBACK_CONSUMER_REQUIRED": "true",
         "INTERNAL_API_HEADER": "x-internal-secret",
         "INTERNAL_API_SECRET": token_hex(32),
@@ -63,7 +62,7 @@ def valid_production_env() -> dict[str, str]:
         "QDRANT_API_KEY": "qdrant-test-key-strong",
         "QDRANT_TIMEOUT_SECONDS": "10",
         "QDRANT_DISTANCE": "Cosine",
-        "QDRANT_COLLECTION_NAME": "osiris_research_corpus",
+        "QDRANT_COLLECTION_NAME": "osiris_research_corpus_v2_20260722_r1",
         "QDRANT_VECTOR_NAME": "repo_embedding",
         "USER_PROFILES_COLLECTION": "user_profiles",
         "VECTOR_DIMENSION": "384",
@@ -73,8 +72,8 @@ def valid_production_env() -> dict[str, str]:
         "REPOSITORY_EMBEDDING_VERSION": "repo-embedding-v2",
         "V2_COMPATIBLE_EMBEDDING_VERSIONS": "repo-embedding-v2",
         "V2_REQUIRED_CONTENT_VERSION": "1",
-        "REPOSITORY_FEATURE_SPEC_VERSION": "v1",
-        "V2_REQUIRED_FEATURE_SPEC_VERSION": "v1",
+        "REPOSITORY_FEATURE_SPEC_VERSION": "v2",
+        "V2_REQUIRED_FEATURE_SPEC_VERSION": "v2",
         "V2_ALLOW_MISSING_EMBEDDING_REVISION": "false",
         "MIN_ELIGIBLE_REPOSITORIES": "1000",
         "README_CHUNK_CHARS": "2500",
@@ -86,9 +85,9 @@ def valid_production_env() -> dict[str, str]:
         "EMBEDDING_CPU_THREADS": "1",
         "HF_HUB_OFFLINE": "true",
         "TRANSFORMERS_OFFLINE": "true",
-        "V2_HEAVY_RANKER_ENABLED": "false",
-        "V2_HEAVY_RANKER_REQUIRED": "false",
-        "V2_HEAVY_RANKER_TRAFFIC_PERCENT": "0",
+        "V2_HEAVY_RANKER_ENABLED": "true",
+        "V2_HEAVY_RANKER_REQUIRED": "true",
+        "V2_HEAVY_RANKER_TRAFFIC_PERCENT": "100",
         "V2_ALLOW_UNQUALIFIED_HEAVY_RANKER": "false",
         "V2_HEAVY_RANKER_CANARY_SALT": "v2-heavy-ranker-2026",
         "ML_MODEL_VERSION": "qdrant-hybrid-v2",
@@ -137,13 +136,23 @@ def test_exact_production_flags_fail_closed() -> None:
     environment = valid_production_env()
     environment.update(
         APP_ENV="prod",
-        LEGACY_ML_API_ENABLED="true",
         V2_FEEDBACK_CONSUMER_REQUIRED="false",
+        V2_USER_COLLECTION_REQUIRED="false",
+        V2_HEAVY_RANKER_ENABLED="false",
+        V2_HEAVY_RANKER_REQUIRED="false",
+        V2_HEAVY_RANKER_TRAFFIC_PERCENT="0",
     )
 
     names = issue_names(environment)
 
-    assert {"APP_ENV", "LEGACY_ML_API_ENABLED", "V2_FEEDBACK_CONSUMER_REQUIRED"} <= names
+    assert {
+        "APP_ENV",
+        "V2_FEEDBACK_CONSUMER_REQUIRED",
+        "V2_USER_COLLECTION_REQUIRED",
+        "V2_HEAVY_RANKER_ENABLED",
+        "V2_HEAVY_RANKER_REQUIRED",
+        "V2_HEAVY_RANKER_TRAFFIC_PERCENT",
+    } <= names
 
 
 def test_secret_error_never_contains_secret() -> None:
@@ -212,6 +221,13 @@ def test_feedback_names_and_qdrant_auth_fail_closed() -> None:
     names = issue_names(environment)
 
     assert {"FEEDBACK_CONSUMER_HEARTBEAT_KEY", "QDRANT_AUTH_MODE", "QDRANT_API_KEY"} <= names
+
+
+def test_production_rejects_non_v2_repository_collection() -> None:
+    environment = valid_production_env()
+    environment["QDRANT_COLLECTION_NAME"] = "osiris_research_corpus"
+
+    assert "QDRANT_COLLECTION_NAME" in issue_names(environment)
 
 
 def test_redis_requires_authenticated_tls_and_image_identity_cannot_be_overridden() -> None:
@@ -292,6 +308,17 @@ def test_heavy_ranker_traffic_requires_ranker_to_be_enabled() -> None:
         V2_HEAVY_RANKER_ENABLED="false",
         V2_HEAVY_RANKER_REQUIRED="false",
         V2_HEAVY_RANKER_TRAFFIC_PERCENT="1",
+    )
+
+    assert "V2_HEAVY_RANKER_TRAFFIC_PERCENT" in issue_names(environment)
+
+
+def test_required_heavy_ranker_requires_all_recommendation_traffic() -> None:
+    environment = valid_production_env()
+    environment.update(
+        V2_HEAVY_RANKER_ENABLED="true",
+        V2_HEAVY_RANKER_REQUIRED="true",
+        V2_HEAVY_RANKER_TRAFFIC_PERCENT="99",
     )
 
     assert "V2_HEAVY_RANKER_TRAFFIC_PERCENT" in issue_names(environment)

@@ -234,7 +234,10 @@ class RepositoryEnricher:
             "forks_count": data.get("forkCount", 0),
             "open_issues_count": data.get("issues", {}).get("totalCount", 0),
             "pull_requests_count": data.get("pullRequests", {}).get("totalCount", 0),
-            "owner": {"login": data.get("owner", {}).get("login")} if data.get("owner") else None,
+            "owner": {
+                "login": data.get("owner", {}).get("login"),
+                "github_id": str(data.get("owner", {}).get("databaseId") or ""),
+            } if data.get("owner") else None,
             "_discovery_category": discovery_category,
             "_discovery_band": discovery_band,
         }
@@ -295,6 +298,7 @@ class RepositoryEnricher:
             "full_name": full_name,
             "github_id": repository.get("github_id"),
             "github_node_id": repository.get("github_node_id"),
+            "owner_github_id": (repository.get("owner") or {}).get("github_id"),
             "star_count": int(repository.get("stargazers_count") or repository.get("watchers_count") or 0),
             "primary_language": primary_lang_str,
             "special_label": special_label,

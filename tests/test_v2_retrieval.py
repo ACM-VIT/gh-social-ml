@@ -15,12 +15,14 @@ from config import (
 from embedding.vector_contract import (
     REPOSITORY_SERVING_ELIGIBILITY_FIELD,
     REPOSITORY_SERVING_ELIGIBILITY_VERSION,
-    legacy_repository_point_id,
-    legacy_user_point_id,
     repository_payload_defaults,
 )
 from inference.feed_assembly import FeedAssemblySystem
-from retrieval.v2_retriever import QdrantV2Retriever
+from retrieval.v2_retriever import (
+    QdrantV2Retriever,
+    RankedRepository,
+    RetrievalDependencyError,
+)
 
 
 VECTOR = [1.0] + [0.0] * (REPOSITORY_EMBEDDING_DIM - 1)
@@ -201,7 +203,7 @@ class HeavyRankerQdrant:
 class DeterministicHeavyRanker:
     ready = True
     production_qualified = True
-    model_version = "heavy-ranker-v1"
+    model_version = "heavy-ranker-v2"
 
     def __init__(self):
         self.calls = []
@@ -226,41 +228,6 @@ def test_qdrant_only_retrieval_deduplicates_and_rejects_legacy_identity():
     items = retriever.recommend(client.user_id, 10, [])
     assert {item.repo_id for item in items} == set(client.repo_ids)
     assert len(items) == 2
-
-
-def test_qdrant_only_retrieval_reads_pre_v2_uuid5_points():
-    client = FakeQdrant()
-    user_id = client.user_id
-    repo_id = client.repo_ids[0]
-
-    def retrieve(collection_name, ids, with_vectors, with_payload=True):
-        assert legacy_user_point_id(user_id) in ids
-        return [
-            SimpleNamespace(
-                id=legacy_user_point_id(user_id),
-                vector=VECTOR,
-                payload=_user_payload(user_id=user_id, last_feedback_version=4),
-            )
-        ]
-
-    def query_points(**_kwargs):
-        return SimpleNamespace(
-            points=[
-                SimpleNamespace(
-                    id=legacy_repository_point_id(repo_id),
-                    score=0.9,
-                    vector={"repo_embedding": VECTOR},
-                    payload=_repository_payload(repo_id, stars=50),
-                )
-            ]
-        )
-
-    client.retrieve = retrieve
-    client.query_points = query_points
-    client.scroll = lambda **_kwargs: ([], None)
-
-    items = QdrantV2Retriever(client=client).recommend(user_id, 10, [])
-    assert [item.repo_id for item in items] == [repo_id]
 
 
 def test_discovery_score_treats_zero_pushed_days_as_fresh():
@@ -302,6 +269,7 @@ def test_v2_retrieval_applies_diversity_freshness_and_deterministic_exploration(
     retriever = QdrantV2Retriever(
         client=client,
         assembler=FeedAssemblySystem(max_same_language=2),
+        heavy_ranker_enabled=False,
     )
     first = retriever.recommend(client.user_id, 8, [], "fixed-generation")
     second = retriever.recommend(client.user_id, 8, [], "fixed-generation")
@@ -319,6 +287,7 @@ def test_v2_heavy_ranker_reranks_full_vector_candidates_and_reports_served_model
         client=client,
         ranker=ranker,
         heavy_ranker_enabled=True,
+        heavy_ranker_required=False,
         heavy_ranker_traffic_percent=100,
     )
 
@@ -327,7 +296,7 @@ def test_v2_heavy_ranker_reranks_full_vector_candidates_and_reports_served_model
     assert batch.ranker_applied is True
     assert batch.heavy_ranker_selected is True
     assert batch.served_ranker == "heavy"
-    assert batch.model_version == "heavy-ranker-v1-v2-adapter"
+    assert batch.model_version == "heavy-ranker-v2"
     assert batch.embedding_version == REPOSITORY_EMBEDDING_VERSION
     assert [item.repo_id for item in batch.items] == [
         client.repo_ids[1],
@@ -341,6 +310,32 @@ def test_v2_heavy_ranker_reranks_full_vector_candidates_and_reports_served_model
     )
 
 
+def test_followed_owner_repositories_receive_only_a_small_capped_boost():
+    repo_ids = [str(uuid.uuid4()) for _ in range(8)]
+    ranked = [
+        RankedRepository(repo_id=repo_id, score=1.0 - index * 0.01, source="semantic")
+        for index, repo_id in enumerate(repo_ids)
+    ]
+
+    adjusted = QdrantV2Retriever._apply_social_boost(
+        ranked,
+        {repo_ids[2], repo_ids[3], repo_ids[4]},
+        limit=8,
+    )
+
+    changed = {
+        item.repo_id
+        for item, original in zip(
+            sorted(adjusted, key=lambda value: repo_ids.index(value.repo_id)),
+            ranked,
+        )
+        if item.score != original.score
+    }
+    assert len(changed) == 2
+    assert changed <= {repo_ids[2], repo_ids[3], repo_ids[4]}
+    assert all(item.score - ranked[repo_ids.index(item.repo_id)].score <= 0.03 for item in adjusted)
+
+
 def test_v2_invalid_heavy_output_falls_back_for_only_that_request():
     client = HeavyRankerQdrant()
     ranker = DeterministicHeavyRanker()
@@ -349,6 +344,7 @@ def test_v2_invalid_heavy_output_falls_back_for_only_that_request():
         client=client,
         ranker=ranker,
         heavy_ranker_enabled=True,
+        heavy_ranker_required=False,
         heavy_ranker_traffic_percent=100,
     )
 
@@ -364,6 +360,29 @@ def test_v2_invalid_heavy_output_falls_back_for_only_that_request():
     assert counters["requests_total"] == 1
     assert counters["heavy_selected"] == 1
     assert counters["hybrid_served"] == 1
+    assert counters["fallback_invalid_heavy_output"] == 1
+
+
+def test_required_v2_heavy_ranker_fails_closed_instead_of_serving_hybrid():
+    client = HeavyRankerQdrant()
+    ranker = DeterministicHeavyRanker()
+    ranker.score_batch = lambda *_args: []
+    retriever = QdrantV2Retriever(
+        client=client,
+        ranker=ranker,
+        heavy_ranker_enabled=True,
+        heavy_ranker_required=True,
+        heavy_ranker_traffic_percent=100,
+    )
+
+    with pytest.raises(RetrievalDependencyError, match="required V2 heavy ranker"):
+        retriever.recommend_batch(client.user_id, 2, [])
+
+    counters = retriever.health()["ranking_counters"]
+    assert counters["requests_total"] == 1
+    assert counters["heavy_selected"] == 1
+    assert counters["heavy_served"] == 0
+    assert counters["hybrid_served"] == 0
     assert counters["fallback_invalid_heavy_output"] == 1
 
 
@@ -457,7 +476,7 @@ def test_default_recommendation_path_has_a_bounded_qdrant_call_budget() -> None:
     )
 
     assert len(batch.items) == 2
-    assert len(client.retrieve_calls) == 1  # user profile, canonical + legacy IDs
+    assert len(client.retrieve_calls) == 1  # canonical user profile lookup
     assert set(client.retrieve_calls[0]["with_payload"]) == {
         "skills",
         "tech_stack",
@@ -482,6 +501,7 @@ def test_default_recommendation_path_has_a_bounded_qdrant_call_budget() -> None:
 def test_production_health_rejects_a_required_unavailable_ranker(monkeypatch):
     monkeypatch.setenv("APP_ENV", "production")
     monkeypatch.setenv("V2_HEAVY_RANKER_REQUIRED", "true")
+    monkeypatch.setenv("V2_ALLOW_UNQUALIFIED_HEAVY_RANKER", "false")
     monkeypatch.setenv("V2_USER_COLLECTION_REQUIRED", "false")
     retriever = QdrantV2Retriever(
         client=HeavyRankerQdrant(),
@@ -514,7 +534,7 @@ def test_one_failed_discovery_channel_does_not_fail_recommendations():
     assert calls == 4
 
 
-def test_heavy_ranker_is_disabled_by_default(monkeypatch):
+def test_heavy_ranker_is_the_default_v2_serving_path(monkeypatch):
     monkeypatch.delenv("V2_HEAVY_RANKER_ENABLED", raising=False)
     monkeypatch.delenv("V2_HEAVY_RANKER_TRAFFIC_PERCENT", raising=False)
     retriever = QdrantV2Retriever(
@@ -522,9 +542,9 @@ def test_heavy_ranker_is_disabled_by_default(monkeypatch):
         ranker=DeterministicHeavyRanker(),
     )
 
-    assert retriever.heavy_ranker_enabled is False
-    assert retriever.heavy_ranker_traffic_percent == 0
-    assert retriever.ranker is None
+    assert retriever.heavy_ranker_enabled is True
+    assert retriever.heavy_ranker_traffic_percent == 100.0
+    assert retriever.ranker is not None
 
 
 def test_heavy_ranker_canary_selection_is_deterministic_and_partitioned():
@@ -532,6 +552,7 @@ def test_heavy_ranker_canary_selection_is_deterministic_and_partitioned():
         client=HeavyRankerQdrant(),
         ranker=DeterministicHeavyRanker(),
         heavy_ranker_enabled=True,
+        heavy_ranker_required=False,
         heavy_ranker_traffic_percent=50,
     )
     user_ids = [str(uuid.UUID(int=index)) for index in range(1, 101)]
@@ -544,7 +565,7 @@ def test_heavy_ranker_canary_selection_is_deterministic_and_partitioned():
     assert not all(first)
 
 
-def test_cold_start_uses_profile_retrieval_but_bypasses_heavy_ranking():
+def test_cold_start_with_onboarding_profile_uses_required_heavy_ranker():
     client = HeavyRankerQdrant()
     ranker = DeterministicHeavyRanker()
     retriever = QdrantV2Retriever(
@@ -563,10 +584,40 @@ def test_cold_start_uses_profile_retrieval_but_bypasses_heavy_ranking():
     )
 
     assert batch.retrieval_mode == "cold_start_profile"
-    assert batch.served_ranker == "hybrid"
-    assert batch.heavy_ranker_selected is False
-    assert ranker.calls == []
+    assert batch.served_ranker == "heavy"
+    assert batch.heavy_ranker_selected is True
+    assert batch.ranker_applied is True
+    assert ranker.calls
     assert client.query_calls  # the initial profile still personalizes retrieval
+
+
+def test_required_v2_cold_start_waits_for_onboarding_vector_without_hybrid():
+    client = HeavyRankerQdrant()
+    client.retrieve = lambda **_kwargs: []
+    retriever = QdrantV2Retriever(
+        client=client,
+        ranker=DeterministicHeavyRanker(),
+        heavy_ranker_enabled=True,
+        heavy_ranker_required=True,
+        heavy_ranker_traffic_percent=100,
+    )
+
+    with pytest.raises(
+        RetrievalDependencyError,
+        match="user profile vector is unavailable",
+    ):
+        retriever.recommend_batch(
+            client.user_id,
+            2,
+            [],
+            "cold-start-vector-pending",
+            True,
+        )
+
+    counters = retriever.health()["ranking_counters"]
+    assert counters["heavy_served"] == 0
+    assert counters["hybrid_served"] == 0
+    assert counters["fallback_user_vector_unavailable"] == 1
 
 
 def test_missing_profile_modes_are_explicit_for_cold_and_normal_requests():
@@ -583,32 +634,26 @@ def test_missing_profile_modes_are_explicit_for_cold_and_normal_requests():
     assert len(cold.items) == len(normal.items) == 2
 
 
-def test_batch_reports_the_exact_compatible_embedding_versions_actually_served():
+def test_batch_reports_only_the_v2_embedding_version():
     client = HeavyRankerQdrant()
     original_point = client._point
 
     def versioned_point(repo_id, **kwargs):
         point = original_point(repo_id, **kwargs)
-        if repo_id == client.repo_ids[1]:
-            point.payload["embedding_version"] = "repo-embedding-v2"
+        point.payload["embedding_version"] = "repo-embedding-v2"
         return point
 
     client._point = versioned_point
     retriever = QdrantV2Retriever(
         client=client,
         heavy_ranker_enabled=False,
-        compatible_embedding_versions={
-            REPOSITORY_EMBEDDING_VERSION,
-            "repo-embedding-v2",
-        },
+        compatible_embedding_versions={"repo-embedding-v2"},
     )
 
     batch = retriever.recommend_batch(client.user_id, 2, [], "mixed")
 
-    assert batch.embedding_versions == tuple(
-        sorted({REPOSITORY_EMBEDDING_VERSION, "repo-embedding-v2"})
-    )
-    assert batch.embedding_version.startswith("compatible-mixed:")
+    assert batch.embedding_versions == ("repo-embedding-v2",)
+    assert batch.embedding_version == "repo-embedding-v2"
 
 
 def test_incompatible_revision_is_never_served_and_empty_batch_is_truthful():

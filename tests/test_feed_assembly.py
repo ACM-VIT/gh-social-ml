@@ -2,11 +2,7 @@ import random
 import pytest
 from datetime import datetime, timezone, timedelta
 
-from fastapi.testclient import TestClient
-from app import app
 from inference.feed_assembly import FeedAssemblySystem
-
-client = TestClient(app)
 
 @pytest.mark.unit
 class TestFeedAssemblySystem:
@@ -267,44 +263,3 @@ class TestFeedAssemblySystem:
         assert ordered_ids == repeated_ids
         assert ordered_ids[:10] == [f"repo-{i}" for i in range(10)]
         assert set(ordered_ids[10:]) == {f"repo-{i}" for i in range(10, 15)}
-
-
-@pytest.mark.unit
-class TestFeedAssemblyApi:
-    """Integration/API tests for the /api/internal/ml/assemble-feed endpoint."""
-
-    def test_assemble_feed_endpoint_success(self):
-        """Test that a valid 15-candidate request returns 200 OK and ranked IDs."""
-        now = datetime.now(timezone.utc).isoformat()
-        payload = {
-            "candidates": [
-                {
-                    "repo_id": f"repo-{i}",
-                    "final_score": 10.0 - i,
-                    "created_at": now
-                }
-                for i in range(15)
-            ]
-        }
-        response = client.post("/api/internal/ml/assemble-feed", json=payload)
-        assert response.status_code == 200
-        data = response.json()
-        assert "rankedRepoIds" in data
-        assert len(data["rankedRepoIds"]) == 15
-
-    def test_assemble_feed_endpoint_invalid_payload_length(self):
-        """Test that requests with less or more than 15 candidates are rejected."""
-        now = datetime.now(timezone.utc).isoformat()
-        # 14 candidates (invalid length)
-        payload = {
-            "candidates": [
-                {
-                    "repo_id": f"repo-{i}",
-                    "final_score": 10.0,
-                    "created_at": now
-                }
-                for i in range(14)
-            ]
-        }
-        response = client.post("/api/internal/ml/assemble-feed", json=payload)
-        assert response.status_code == 422

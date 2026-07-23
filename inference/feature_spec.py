@@ -1,7 +1,7 @@
 """Canonical feature dimensions and ordering for the heavy ranker."""
 
-FEATURE_SPEC_VERSION = "v1"
-RANKER_MODEL_VERSION = "heavy-ranker-v1"
+FEATURE_SPEC_VERSION = "v2"
+RANKER_MODEL_VERSION = "heavy-ranker-v2"
 
 FEATURE_ORDER = [
     "doc_quality",
